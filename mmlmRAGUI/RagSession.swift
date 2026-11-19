@@ -90,6 +90,34 @@ enum RagCommand {
     }
 }
 
+/// Path and corpus directory shared by every window. Each window still has its own conversation.
+@MainActor
+@Observable
+final class RagSettings {
+    var ragPath: String {
+        didSet { defaults.set(ragPath, forKey: Keys.path) }
+    }
+
+    var workingDirectory: String {
+        didSet { defaults.set(workingDirectory, forKey: Keys.directory) }
+    }
+
+    var statusText = "未檢查。"
+
+    private let defaults = UserDefaults.standard
+
+    private enum Keys {
+        static let path = "ragExecutablePath"
+        static let directory = "ragWorkingDirectory"
+    }
+
+    init() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        ragPath = defaults.string(forKey: Keys.path) ?? ""
+        workingDirectory = defaults.string(forKey: Keys.directory) ?? home
+    }
+}
+
 @MainActor
 @Observable
 final class RagSession {
@@ -103,52 +131,77 @@ final class RagSession {
         acceptedExtensions.compactMap { UTType(filenameExtension: $0) }
     }
 
+    private let settings: RagSettings
+
     var ragPath: String {
-        didSet { defaults.set(ragPath, forKey: Keys.path) }
+        get { settings.ragPath }
+        set { settings.ragPath = newValue }
     }
 
     var workingDirectory: String {
-        didSet { defaults.set(workingDirectory, forKey: Keys.directory) }
+        get { settings.workingDirectory }
+        set { settings.workingDirectory = newValue }
     }
 
-    var statusText = "未檢查。"
+    var statusText: String {
+        get { settings.statusText }
+        set { settings.statusText = newValue }
+    }
+
     var logText = ""
     var answerText = ""
     var question = ""
     var isBusy = false
     var busyLabel = ""
+    /// True while an `ask` is in flight, including the wait before the first line.
+    private(set) var isAsking = false
     var errorMessage: String?
     var notice: String?
     private(set) var queuedCount = 0
 
-    private let defaults = UserDefaults.standard
     private var ingestQueue: [URL] = []
     private var job: Task<Void, Never>?
     private var jobGeneration = 0
     private var didPrepare = false
+    /// Launch status hits the shared settings text once. Later windows skip it so they can ask immediately.
+    private static var didCheckStatus = false
 
-    private enum Keys {
-        static let path = "ragExecutablePath"
-        static let directory = "ragWorkingDirectory"
-    }
-
-    init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        ragPath = defaults.string(forKey: Keys.path) ?? ""
-        workingDirectory = defaults.string(forKey: Keys.directory) ?? home
+    init(settings: RagSettings) {
+        self.settings = settings
     }
 
     func prepare() async {
         guard !didPrepare else { return }
         didPrepare = true
+        guard !Self.didCheckStatus else { return }
+        Self.didCheckStatus = true
         await refreshStatus()
     }
 
     func usePathAndRefresh() async {
         notice = nil
-        guard FileManager.default.isExecutableFile(atPath: ragPath) else {
+        let expanded = (ragPath as NSString).expandingTildeInPath
+        if Self.isDirectory(expanded) {
+            guard Self.projectRoot(at: expanded) != nil else {
+                errorMessage = "呢個路徑係資料夾，唔係可執行的 rag。語料目錄要包含 rag.toml，請填喺工作目錄。"
+                return
+            }
+        } else if Self.isRunnableFile(expanded) {
+            ragPath = expanded
+        } else {
             errorMessage = "呢個路徑唔係可執行的 rag。"
             return
+        }
+        guard await locateIfNeeded() else {
+            errorMessage = missingToolMessage
+            return
+        }
+        if Self.isDirectory(expanded) {
+            if Self.sourceRoot(near: workingDirectory) != nil {
+                notice = "工作目錄已設為 \(workingDirectory)，並用裡面的程式。"
+            } else {
+                notice = "工作目錄已設為 \(workingDirectory)。"
+            }
         }
         await refreshStatus()
     }
@@ -162,7 +215,7 @@ final class RagSession {
 
     private func performStatus(generation: Int) async {
         guard await locateIfNeeded() else {
-            statusText = "搵唔到 rag。可以用 Homebrew 裝：brew install mark1688288/mmlmrag/mmlmrag，或者自己填上可執行檔路徑。"
+            statusText = missingToolMessage
             finish(generation: generation)
             return
         }
@@ -191,10 +244,11 @@ final class RagSession {
     func ask() {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let generation = beginJob(label: "提問") else {
+        guard let generation = beginJob(label: "等緊 rag 回覆…") else {
             notice = "等而家呢個工作完先再提問。"
             return
         }
+        isAsking = true
         answerText = ""
         logText = ""
         job = Task {
@@ -209,13 +263,14 @@ final class RagSession {
         ingestQueue.removeAll()
         queuedCount = 0
         isBusy = false
+        isAsking = false
         busyLabel = ""
         notice = "已取消。"
     }
 
     private func performAsk(_ trimmed: String, generation: Int) async {
         guard await locateIfNeeded() else {
-            errorMessage = "搵唔到 rag，未能提問。"
+            errorMessage = missingToolMessage
             finish(generation: generation)
             return
         }
@@ -257,7 +312,7 @@ final class RagSession {
             }
         }
         guard await locateIfNeeded() else {
-            errorMessage = "搵唔到 rag，未能入庫。"
+            errorMessage = missingToolMessage
             ingestQueue.removeAll()
             queuedCount = 0
             finish(generation: generation)
@@ -282,6 +337,7 @@ final class RagSession {
     private func finish(generation: Int) {
         guard generation == jobGeneration else { return }
         isBusy = false
+        isAsking = false
         busyLabel = ""
     }
 
@@ -289,8 +345,8 @@ final class RagSession {
         arguments: [String],
         onLine: @escaping @MainActor (String, Bool) -> Void
     ) async {
-        guard let executable = executableURL else {
-            errorMessage = "搵唔到 rag。"
+        guard let launch = await resolveLaunch() else {
+            errorMessage = missingToolMessage
             return
         }
         guard let directory = workingDirectoryURL else {
@@ -299,10 +355,10 @@ final class RagSession {
         }
 
         let stream = RagCommand.stream(
-            executable: executable.path,
-            arguments: arguments,
+            executable: launch.executable,
+            arguments: launch.prefix + arguments,
             workingDirectory: directory,
-            environment: environmentForRag()
+            environment: environmentForRag(extra: launch.extraEnvironment)
         )
 
         do {
@@ -318,23 +374,139 @@ final class RagSession {
     }
 
     private func locateIfNeeded() async -> Bool {
-        if FileManager.default.isExecutableFile(atPath: ragPath) {
-            return true
-        }
-        if let found = Self.candidatePaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-            ragPath = found
-            return true
-        }
-        if let found = await Self.whichViaLoginShell(), FileManager.default.isExecutableFile(atPath: found) {
-            ragPath = found
-            return true
-        }
-        return false
+        await resolveLaunch() != nil
     }
 
-    private var executableURL: URL? {
-        guard FileManager.default.isExecutableFile(atPath: ragPath) else { return nil }
-        return URL(fileURLWithPath: ragPath)
+    private struct RagLaunch {
+        var executable: String
+        var prefix: [String]
+        var extraEnvironment: [String: String]
+    }
+
+    /// `main()` reads `sys.argv`, so the child is `python -c <this> <rag args>`.
+    private static let sourceBootstrap = "from ragcli.cli import main; raise SystemExit(main())"
+
+    /// A checkout wins over an installed `rag`. The installed copy can be older
+    /// than the SQLite schema in that folder, and then `status` refuses to run.
+    private func resolveLaunch() async -> RagLaunch? {
+        adoptProjectDirectoryIfNeeded()
+        if Self.isRunnableFile(ragPath) {
+            return RagLaunch(
+                executable: (ragPath as NSString).expandingTildeInPath,
+                prefix: [],
+                extraEnvironment: [:]
+            )
+        }
+        if let source = Self.sourceRoot(near: workingDirectory) ?? Self.sourceRoot(near: ragPath) {
+            guard let python = Self.pythonExecutable(for: source) else { return nil }
+            let src = (source as NSString).appendingPathComponent("src")
+            return RagLaunch(
+                executable: python,
+                prefix: ["-c", Self.sourceBootstrap],
+                extraEnvironment: ["PYTHONPATH": src]
+            )
+        }
+        guard let found = await resolveExecutable() else { return nil }
+        if ragPath != found {
+            ragPath = found
+        }
+        return RagLaunch(executable: found, prefix: [], extraEnvironment: [:])
+    }
+
+    private var missingToolMessage: String {
+        if Self.sourceRoot(near: workingDirectory) != nil || Self.sourceRoot(near: ragPath) != nil {
+            return "搵唔到 Python，未能執行資料夾入面的 rag。"
+        }
+        return "搵唔到 rag。可以用 Homebrew 裝：brew install mark1688288/mmlmrag/mmlmrag，或者自己填上可執行檔路徑。"
+    }
+
+    private static func sourceRoot(near path: String) -> String? {
+        guard let root = projectRoot(at: path) else { return nil }
+        let cli = (root as NSString).appendingPathComponent("src/ragcli/cli.py")
+        guard FileManager.default.isReadableFile(atPath: cli) else { return nil }
+        return root
+    }
+
+    private static func pythonExecutable(for sourceRoot: String) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = [
+            sourceRoot + "/.venv/bin/python",
+            sourceRoot + "/venv/bin/python",
+            home + "/.mmlmrag/venv/bin/python",
+            "/opt/homebrew/bin/python3.13",
+            "/usr/local/bin/python3.13",
+        ]
+        return candidates.first(where: isRunnableFile)
+    }
+
+    /// A searchable directory also passes `isExecutableFile`. Launching it
+    /// returns EACCES, shown as "Permission denied". A folder that contains
+    /// `rag.toml` is the corpus, so keep it as the working directory.
+    private func adoptProjectDirectoryIfNeeded() {
+        let expanded = (ragPath as NSString).expandingTildeInPath
+        guard Self.isDirectory(expanded), let project = Self.projectRoot(at: expanded) else {
+            return
+        }
+        if workingDirectory != project {
+            workingDirectory = project
+        }
+    }
+
+    private func resolveExecutable() async -> String? {
+        if Self.isRunnableFile(ragPath) {
+            return (ragPath as NSString).expandingTildeInPath
+        }
+        let nearby = Self.localExecutableCandidates(near: workingDirectory)
+        if let found = (nearby + Self.candidatePaths).first(where: Self.isRunnableFile) {
+            return found
+        }
+        if let found = await Self.whichViaLoginShell(), Self.isRunnableFile(found) {
+            return found
+        }
+        return nil
+    }
+
+    private static func isDirectory(_ path: String) -> Bool {
+        let expanded = (path as NSString).expandingTildeInPath
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+    }
+
+    private static func isRunnableFile(_ path: String) -> Bool {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard !expanded.isEmpty, !isDirectory(expanded) else { return false }
+        return FileManager.default.isExecutableFile(atPath: expanded)
+    }
+
+    /// The checkout that owns `rag.toml`, walking up from `path`.
+    /// Corpus lookup uses the same root to find `data/corpus.sqlite`.
+    static func projectRoot(at path: String) -> String? {
+        let expanded = (path as NSString).expandingTildeInPath
+        var url = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL
+        if !isDirectory(url.path) {
+            url.deleteLastPathComponent()
+        }
+        for _ in 0..<8 {
+            if FileManager.default.fileExists(atPath: url.appendingPathComponent("rag.toml").path) {
+                return url.path
+            }
+            if url.path == "/" {
+                return nil
+            }
+            url.deleteLastPathComponent()
+        }
+        return nil
+    }
+
+    private static func localExecutableCandidates(near directory: String) -> [String] {
+        let expanded = (directory as NSString).expandingTildeInPath
+        let root = projectRoot(at: expanded) ?? (isDirectory(expanded) ? expanded : nil)
+        guard let root else { return [] }
+        return [
+            root + "/.venv/bin/rag",
+            root + "/venv/bin/rag",
+        ]
     }
 
     private var workingDirectoryURL: URL? {
@@ -348,12 +520,23 @@ final class RagSession {
 
     /// GUI apps do not inherit a Homebrew PATH. The child still needs it
     /// when `rag` locates Python or Ollama.
-    private func environmentForRag() -> [String: String] {
+    private func environmentForRag(extra: [String: String] = [:]) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         let prefix = "/opt/homebrew/bin:/usr/local/bin"
         let current = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         env["PATH"] = "\(prefix):\(current)"
         env["PYTHONUNBUFFERED"] = "1"
+        // Xcode injects DYLD_INSERT_LIBRARIES. A child Python aborts if it stays set.
+        for key in Array(env.keys) where key.hasPrefix("DYLD_") {
+            env.removeValue(forKey: key)
+        }
+        for (key, value) in extra {
+            if key == "PYTHONPATH", let existing = env["PYTHONPATH"], !existing.isEmpty {
+                env[key] = "\(value):\(existing)"
+            } else {
+                env[key] = value
+            }
+        }
         return env
     }
 
@@ -363,6 +546,7 @@ final class RagSession {
             "/opt/homebrew/bin/rag",
             "/usr/local/bin/rag",
             home + "/.local/bin/rag",
+            home + "/.mmlmrag/venv/bin/rag",
         ]
     }
 
