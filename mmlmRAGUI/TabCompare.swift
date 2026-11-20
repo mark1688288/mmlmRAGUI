@@ -209,6 +209,8 @@ struct TabComparePage: View {
     @State private var leftID: UUID?
     @State private var rightID: UUID?
     @State private var catalog = OpenTabCatalog.shared
+    /// Narrow windows show one side. True is the left page.
+    @State private var showsLeftPage = true
 
     var body: some View {
         Group {
@@ -219,7 +221,17 @@ struct TabComparePage: View {
                     description: Text("開住至少兩個 mmlmRAG 分頁，就可以左右並排比較提問同回答。")
                 )
             } else {
-                comparison
+                GeometryReader { proxy in
+                    let isCompact = proxy.size.width <= ContentView.iPhone18ProScreenWidth
+                    Group {
+                        if isCompact {
+                            compactComparison
+                        } else {
+                            comparison
+                        }
+                    }
+                    .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -241,6 +253,24 @@ struct TabComparePage: View {
             column(sideTitle: "左邊", selection: leftSelection)
             Divider()
             column(sideTitle: "右邊", selection: rightSelection)
+        }
+    }
+
+    /// One side at a time. The toolbar button swaps left and right.
+    private var compactComparison: some View {
+        column(
+            sideTitle: showsLeftPage ? "左邊" : "右邊",
+            selection: showsLeftPage ? leftSelection : rightSelection
+        )
+        .id(showsLeftPage)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button(showsLeftPage ? "右邊" : "左邊") {
+                    showsLeftPage.toggle()
+                }
+                .help(showsLeftPage ? "轉去右邊" : "轉去左邊")
+                .accessibilityLabel(showsLeftPage ? "轉去右邊" : "轉去左邊")
+            }
         }
     }
 

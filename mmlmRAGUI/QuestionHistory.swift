@@ -92,6 +92,50 @@ final class QuestionHistoryStore {
         return record
     }
 
+    /// Removes the saved rows with these ids. Other rows stay.
+    @discardableResult
+    func delete(ids: Set<Int64>) -> Bool {
+        prepare()
+        guard !ids.isEmpty else { return false }
+        guard let database else { return false }
+
+        if let message = execute("BEGIN IMMEDIATE", in: database) {
+            lastError = "刪除唔到提問記錄：\(message)"
+            return false
+        }
+
+        let sql = "DELETE FROM question_records WHERE id = ?"
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            _ = execute("ROLLBACK", in: database)
+            lastError = deleteFailure(database)
+            return false
+        }
+        defer { sqlite3_finalize(statement) }
+
+        for id in ids {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            guard sqlite3_bind_int64(statement, 1, id) == SQLITE_OK,
+                  sqlite3_step(statement) == SQLITE_DONE
+            else {
+                _ = execute("ROLLBACK", in: database)
+                lastError = deleteFailure(database)
+                return false
+            }
+        }
+
+        if let message = execute("COMMIT", in: database) {
+            _ = execute("ROLLBACK", in: database)
+            lastError = "刪除唔到提問記錄：\(message)"
+            return false
+        }
+
+        records.removeAll { ids.contains($0.id) }
+        lastError = nil
+        return true
+    }
+
     private func reload() {
         guard let database else { return }
         let sql = """
@@ -205,20 +249,92 @@ final class QuestionHistoryStore {
         "寫唔到提問記錄：\(Self.errorText(database))"
     }
 
+    private func deleteFailure(_ database: OpaquePointer) -> String {
+        "刪除唔到提問記錄：\(Self.errorText(database))"
+    }
+
+    /// Runs one statement. Returns the SQLite message when it fails.
+    private func execute(_ sql: String, in database: OpaquePointer) -> String? {
+        var error: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(database, sql, nil, nil, &error)
+        if result == SQLITE_OK {
+            return nil
+        }
+        let message = error.map { String(cString: $0) } ?? Self.errorText(database)
+        sqlite3_free(error)
+        return message
+    }
+
     private static func errorText(_ database: OpaquePointer) -> String {
         String(cString: sqlite3_errmsg(database))
     }
 }
 
-/// Sidebar list of saved questions. The selected row is the one loaded in this tab.
+/// Sidebar list of saved questions. The search field matches wording and paraphrases.
+/// Checkboxes pick rows to delete. The row itself loads that question.
 struct QuestionHistoryList: View {
     let records: [QuestionRecord]
     let problem: String?
     let currentID: Int64?
     let onSelect: (QuestionRecord) -> Void
     let onOpenInNewTab: (QuestionRecord) -> Void
+    let onDelete: (Set<Int64>) -> Void
 
     @State private var hoveredID: Int64?
+    @State private var selectedIDs: Set<Int64> = []
+    @State private var query = ""
+    @State private var semanticIDs: [Int64] = []
+    @State private var isSearching = false
+    @State private var searchGeneration = 0
+    @State private var searchTask: Task<Void, Never>?
+    @State private var modelQuery = ""
+    @State private var modelExclusions: [String] = []
+    @State private var modelWantsAbsence = false
+    @State private var assistantPhase: AssistantPhase = .idle
+
+    private enum AssistantPhase: Equatable {
+        case idle
+        case checking
+        case applied
+        case unavailable
+        case failed
+    }
+
+    private var trimmedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Model phrases apply only to the sentence that produced them.
+    private var searchIntent: HistoryQueryIntent {
+        let trimmed = trimmedQuery
+        let matchesModel = modelQuery == trimmed && !trimmed.isEmpty
+        return HistorySearch.resolvedIntent(
+            query: query,
+            modelExclusions: matchesModel ? modelExclusions : [],
+            modelWantsAbsence: matchesModel && modelWantsAbsence
+        )
+    }
+
+    private var visibleRecords: [QuestionRecord] {
+        HistorySearch.ordered(
+            records,
+            query: query,
+            semanticIDs: semanticIDs,
+            intent: searchIntent
+        )
+    }
+
+    private var visibleIDs: Set<Int64> {
+        Set(visibleRecords.map(\.id))
+    }
+
+    private var selectedVisibleIDs: Set<Int64> {
+        selectedIDs.intersection(visibleIDs)
+    }
+
+    private var allSelected: Bool {
+        !visibleRecords.isEmpty && visibleIDs.isSubset(of: selectedIDs)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -235,32 +351,258 @@ struct QuestionHistoryList: View {
                     description: Text("儲存之後，提問同回答會列喺呢度。")
                 )
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(records) { record in
-                                historyButton(record)
-                                    .id(record.id)
+                searchField
+                if visibleRecords.isEmpty {
+                    ContentUnavailableView(
+                        emptyTitle,
+                        systemImage: "magnifyingglass",
+                        description: Text(emptyDetail)
+                    )
+                } else {
+                    selectionBar
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 4) {
+                                ForEach(visibleRecords) { record in
+                                    historyButton(record)
+                                        .id(record.id)
+                                }
                             }
                         }
-                    }
-                    .onChange(of: currentID) { _, id in
-                        guard let id else { return }
-                        proxy.scrollTo(id, anchor: .top)
+                        .onChange(of: currentID) { _, id in
+                            guard let id else { return }
+                            proxy.scrollTo(id, anchor: .top)
+                        }
                     }
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onChange(of: records.map(\.id)) { _, ids in
+            selectedIDs.formIntersection(ids)
+            scheduleSemanticSearch(resetSemantic: false)
+        }
+        .onChange(of: query) { _, _ in
+            scheduleSemanticSearch(resetSemantic: true)
+        }
+        .onDisappear {
+            searchTask?.cancel()
+        }
+    }
+
+    private var emptyTitle: String {
+        if assistantPhase == .checking { return "AI 幫手核對緊" }
+        if isSearching { return "搜尋緊" }
+        return "搵唔到相符記錄"
+    }
+
+    private var emptyDetail: String {
+        if assistantPhase == .checking {
+            return "對緊呢句說話係咪真係符合，包括否定。"
+        }
+        if isSearching {
+            return "對緊呢句說話同已儲存的提問、回答。"
+        }
+        return "試下另一句說話，或者清空搜尋。"
+    }
+
+    private var assistantCaption: String {
+        switch assistantPhase {
+        case .idle:
+            return ""
+        case .checking:
+            return "AI 幫手核對緊"
+        case .applied:
+            return "AI 幫手已排除否定嘅字眼"
+        case .unavailable:
+            return "AI 幫手未就緒，已用否定規則排除"
+        case .failed:
+            return "AI 幫手暫時回應唔到，已用否定規則排除"
+        }
+    }
+
+    private var searchField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("用自然語言搜尋提問同回答", text: $query)
+                    .textFieldStyle(.plain)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel("搜尋歷史")
+                if isSearching {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(assistantPhase == .checking ? "AI 幫手核對緊" : "搜尋緊")
+                }
+                if !query.isEmpty {
+                    Button {
+                        query = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("清空搜尋")
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.primary.opacity(0.05))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.primary.opacity(0.16))
+            }
+            if assistantPhase != .idle {
+                Text(assistantCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .help("用一句說話搜尋。AI 幫手會理解否定，例如「冇提過黃碧嬌」。")
+    }
+
+    /// Wording matches update with the field. A negation is applied before paraphrases arrive.
+    private func scheduleSemanticSearch(resetSemantic: Bool) {
+        searchTask?.cancel()
+        searchGeneration += 1
+        let generation = searchGeneration
+        let trimmed = trimmedQuery
+        if resetSemantic {
+            semanticIDs = []
+            modelQuery = ""
+            modelExclusions = []
+            modelWantsAbsence = false
+            assistantPhase = openingPhase(for: trimmed)
+            selectedIDs.formIntersection(visibleIDs)
+        }
+        guard trimmed.count >= 2 else {
+            isSearching = false
+            semanticIDs = []
+            modelQuery = ""
+            modelExclusions = []
+            modelWantsAbsence = false
+            assistantPhase = .idle
+            return
+        }
+        let reading = HistorySearch.intent(for: trimmed)
+        let absenceOnly = reading.wantsAbsence && reading.affirmativeQuery.isEmpty
+        let askAssistant = HistorySearch.mayNeedAssistant(trimmed) && HistorySearchAssistant.isReady
+        if absenceOnly && !askAssistant {
+            isSearching = false
+            return
+        }
+        isSearching = true
+        let snapshot = records
+        searchTask = Task {
+            do {
+                try await Task.sleep(nanoseconds: 220_000_000)
+            } catch {
+                return
+            }
+            guard generation == searchGeneration else { return }
+            if !absenceOnly {
+                let embedQuery = reading.wantsAbsence ? reading.affirmativeQuery : trimmed
+                let ids = await HistorySemanticSearch.shared.matchingIDs(in: snapshot, query: embedQuery)
+                guard generation == searchGeneration else { return }
+                semanticIDs = ids
+            }
+            if askAssistant {
+                let interpreted = await HistorySearchAssistant.interpret(trimmed)
+                guard generation == searchGeneration else { return }
+                if let interpreted {
+                    modelQuery = trimmed
+                    modelExclusions = interpreted.phrases
+                    modelWantsAbsence = interpreted.wantsAbsence
+                    let resolved = HistorySearch.resolvedIntent(
+                        query: trimmed,
+                        modelExclusions: interpreted.phrases,
+                        modelWantsAbsence: interpreted.wantsAbsence
+                    )
+                    if resolved.wantsAbsence, resolved.affirmativeQuery.isEmpty {
+                        semanticIDs = []
+                    } else if resolved.wantsAbsence,
+                              resolved.affirmativeQuery != reading.affirmativeQuery,
+                              resolved.affirmativeQuery.count >= 2 {
+                        let ids = await HistorySemanticSearch.shared.matchingIDs(
+                            in: snapshot,
+                            query: resolved.affirmativeQuery
+                        )
+                        guard generation == searchGeneration else { return }
+                        semanticIDs = ids
+                    }
+                    assistantPhase = resolved.wantsAbsence ? .applied : .idle
+                } else if reading.wantsAbsence {
+                    assistantPhase = .failed
+                } else {
+                    assistantPhase = .idle
+                }
+            } else if reading.wantsAbsence {
+                assistantPhase = .unavailable
+            } else {
+                assistantPhase = .idle
+            }
+            selectedIDs.formIntersection(visibleIDs)
+            isSearching = false
+        }
+    }
+
+    private func openingPhase(for trimmed: String) -> AssistantPhase {
+        guard trimmed.count >= 2, HistorySearch.mayNeedAssistant(trimmed) else { return .idle }
+        if HistorySearchAssistant.isReady { return .checking }
+        if HistorySearch.intent(for: trimmed).wantsAbsence { return .unavailable }
+        return .idle
+    }
+
+    private var selectionBar: some View {
+        HStack(spacing: 8) {
+            Button(allSelected ? "取消全選" : "全選") {
+                if allSelected {
+                    selectedIDs.subtract(visibleIDs)
+                } else {
+                    selectedIDs.formUnion(visibleIDs)
+                }
+            }
+            .controlSize(.small)
+            if !selectedVisibleIDs.isEmpty {
+                Text("已揀 \(selectedVisibleIDs.count) 條")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Button("刪除", role: .destructive) {
+                deleteSelected()
+            }
+            .controlSize(.small)
+            .disabled(selectedVisibleIDs.isEmpty)
+            .help(selectedVisibleIDs.isEmpty ? "先揀要刪除的提問記錄" : "刪除已揀的 \(selectedVisibleIDs.count) 條提問記錄")
+        }
     }
 
     private func historyButton(_ record: QuestionRecord) -> some View {
-        Button {
-            onSelect(record)
-        } label: {
-            historyLabel(record)
+        HStack(alignment: .top, spacing: 6) {
+            Toggle(isOn: selectionBinding(for: record.id)) {
+                Text("揀呢條記錄")
+            }
+            .toggleStyle(.checkbox)
+            .labelsHidden()
+            .fixedSize()
+            .padding(.top, 8)
+            .accessibilityLabel("揀呢條記錄")
+
+            Button {
+                onSelect(record)
+            } label: {
+                historyLabel(record)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(accessibilityLabel(for: record))
+            .accessibilityHint("載入呢條提問同回答")
         }
-        .buttonStyle(.plain)
         .contextMenu {
             Button("開啟於新分頁") {
                 onOpenInNewTab(record)
@@ -273,8 +615,44 @@ struct QuestionHistoryList: View {
                 hoveredID = nil
             }
         }
-        .accessibilityLabel(accessibilityLabel(for: record))
-        .accessibilityHint("載入呢條提問同回答")
+        .accessibilityElement(children: .contain)
+    }
+
+    private func selectionBinding(for id: Int64) -> Binding<Bool> {
+        Binding(
+            get: { selectedIDs.contains(id) },
+            set: { isSelected in
+                if isSelected {
+                    selectedIDs.insert(id)
+                } else {
+                    selectedIDs.remove(id)
+                }
+            }
+        )
+    }
+
+    private func deleteSelected() {
+        let ids = selectedVisibleIDs
+        guard !ids.isEmpty, confirmDelete(count: ids.count) else { return }
+        onDelete(ids)
+    }
+
+    private func confirmDelete(count: Int) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "刪除提問記錄"
+        alert.informativeText = count == 1
+            ? "刪除呢條提問記錄？刪除之後搵唔返。"
+            : "刪除 \(count) 條提問記錄？刪除之後搵唔返。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "刪除")
+        alert.addButton(withTitle: "取消")
+        if alert.buttons.indices.contains(0) {
+            alert.buttons[0].hasDestructiveAction = true
+        }
+        if alert.buttons.indices.contains(1) {
+            alert.buttons[1].keyEquivalent = "\u{1b}"
+        }
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     private func historyLabel(_ record: QuestionRecord) -> some View {
@@ -305,6 +683,9 @@ struct QuestionHistoryList: View {
     private func rowFill(for record: QuestionRecord) -> Color {
         if record.id == currentID {
             return Color.accentColor.opacity(0.18)
+        }
+        if selectedIDs.contains(record.id) {
+            return Color.accentColor.opacity(0.1)
         }
         if record.id == hoveredID {
             return Color.primary.opacity(0.08)

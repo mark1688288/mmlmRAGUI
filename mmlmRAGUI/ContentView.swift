@@ -13,6 +13,8 @@ struct ContentView: View {
     @State private var sidebarTab = SidebarTab.ingest
     /// Wide windows show both columns. Narrow windows show the sidebar, or only the main page when this is detailOnly.
     @State private var columnVisibility = NavigationSplitViewVisibility.all
+    /// Width of the 文件 sidebar. Every mmlmRAG tab reads and writes this same value.
+    @AppStorage(DocumentsSidebarWidthPolicy.defaultsKey) private var documentsSidebarWidth = DocumentsSidebarWidthPolicy.fallback
     @State private var documentPreview = DocumentPreviewModel()
     /// Stable identity for this window's preview cache. A new tab gets a new one.
     @State private var tabID = UUID()
@@ -23,7 +25,7 @@ struct ContentView: View {
     @State private var savedAnswer = ""
 
     /// Portrait width of the iPhone 18 Pro, in points (1206 px at 3x).
-    fileprivate static let iPhone18ProScreenWidth: CGFloat = 402
+    static let iPhone18ProScreenWidth: CGFloat = 402
     @FocusState private var isQuestionFocused: Bool
     @Environment(\.appearsActive) private var windowIsActive
     @Environment(\.openWindow) private var openWindow
@@ -61,6 +63,9 @@ struct ContentView: View {
             .background {
                 SidebarToggleBridge(isExpanded: sidebarIsExpanded, toggle: toggleSidebar)
             }
+            .background {
+                NewTabButtonKeeper()
+            }
         }
         .navigationTitle(windowTitle)
         .task {
@@ -71,6 +76,11 @@ struct ContentView: View {
             if dirty, session.notice == "已儲存提問記錄。" {
                 session.notice = nil
             }
+        }
+        .onChange(of: history.records) { old, new in
+            let removed = Set(old.map(\.id)).subtracting(new.map(\.id))
+            guard !removed.isEmpty else { return }
+            releaseDeletedLink(removed)
         }
         .onChange(of: session.isAsking) { _, asking in
             guard asking else { return }
@@ -214,6 +224,15 @@ struct ContentView: View {
 
     private func splitContent(availableWidth: CGFloat) -> some View {
         let width = sidebarColumnWidth(fitting: availableWidth)
+        let columnVisible = columnVisibility != .detailOnly
+        let sharedWidth = columnVisible
+            ? DocumentsSidebarWidthPolicy.enforced(
+                stored: documentsSidebarWidth,
+                columnMin: width.min,
+                columnMax: width.max,
+                availableWidth: availableWidth
+            )
+            : nil
         return NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
                 .navigationSplitViewColumnWidth(
@@ -221,6 +240,17 @@ struct ContentView: View {
                     ideal: width.ideal,
                     max: width.max
                 )
+                .background {
+                    DocumentsSidebarWidthSync(
+                        enforcedWidth: sharedWidth,
+                        remembersDrag: columnVisible,
+                        sidebarTab: sidebarTab,
+                        availableWidth: availableWidth
+                    ) { measured in
+                        guard abs(documentsSidebarWidth - measured) >= 1 else { return }
+                        documentsSidebarWidth = measured
+                    }
+                }
         } detail: {
             detail
         }
@@ -240,26 +270,13 @@ struct ContentView: View {
     }
 
     /// Preferred sidebar widths. The minimum shrinks only when the window is too narrow for both columns.
+    /// 入庫, 文件, and 歷史 share one saved width.
     private func sidebarColumnWidth(fitting availableWidth: CGFloat) -> (min: CGFloat, ideal: CGFloat, max: CGFloat) {
-        let preferredMin: CGFloat
-        let preferredIdeal: CGFloat
-        let preferredMax: CGFloat
-        switch sidebarTab {
-        case .documents:
-            preferredMin = 420
-            preferredIdeal = 560
-            preferredMax = 900
-        case .history:
-            preferredMin = 320
-            preferredIdeal = 400
-            preferredMax = 560
-        case .ingest:
-            preferredMin = 300
-            preferredIdeal = 340
-            preferredMax = 460
-        }
-        let mainPageReserve: CGFloat = 240
-        let minWidth = min(preferredMin, max(160, availableWidth - mainPageReserve))
+        let preferredMin = DocumentsSidebarWidthPolicy.preferredMin
+        let preferredIdeal = DocumentsSidebarWidthPolicy.preferredIdeal(stored: documentsSidebarWidth)
+        let preferredMax = DocumentsSidebarWidthPolicy.preferredMax
+        let mainPageReserve = DocumentsSidebarWidthPolicy.mainPageReserve
+        let minWidth = min(preferredMin, max(DocumentsSidebarWidthPolicy.collapsedFloor, availableWidth - mainPageReserve))
         let idealWidth = min(max(preferredIdeal, minWidth), preferredMax)
         return (minWidth, idealWidth, preferredMax)
     }
@@ -291,7 +308,8 @@ struct ContentView: View {
                     problem: history.lastError,
                     currentID: isRecordDirty ? nil : linkedRecordID,
                     onSelect: loadRecord,
-                    onOpenInNewTab: openInNewTab
+                    onOpenInNewTab: openInNewTab,
+                    onDelete: deleteHistoryRecords
                 )
             }
         }
@@ -491,6 +509,32 @@ struct ContentView: View {
             return "呢條提問記錄已儲存"
         }
         return "未有可儲存的提問"
+    }
+
+    private func deleteHistoryRecords(_ ids: Set<Int64>) {
+        guard history.delete(ids: ids) else {
+            session.errorMessage = history.lastError ?? "刪除唔到提問記錄。"
+            return
+        }
+        releaseDeletedLink(ids)
+        session.notice = ids.count == 1 ? "已刪除 1 條提問記錄。" : "已刪除 \(ids.count) 條提問記錄。"
+    }
+
+    /// Drops the link when another window deleted the row this tab is showing.
+    /// A clean copy of that row leaves the page. Edits stay, so they can be saved again.
+    private func releaseDeletedLink(_ ids: Set<Int64>) {
+        guard let linkedRecordID, ids.contains(linkedRecordID) else { return }
+        let showingSavedCopy = !isRecordDirty
+        self.linkedRecordID = nil
+        savedQuestion = ""
+        savedAnswer = ""
+        guard showingSavedCopy else { return }
+        session.question = ""
+        session.answerText = ""
+        session.logText = ""
+        if session.notice == "已儲存提問記錄。" {
+            session.notice = nil
+        }
     }
 
     @discardableResult
@@ -1125,6 +1169,554 @@ private final class PreviewTabMonitorView: NSView {
             NotificationCenter.default.removeObserver(observer)
             self.observer = nil
         }
+    }
+}
+
+/// Shared sidebar width for 入庫, 文件, and 歷史. Every mmlmRAG tab reads the same UserDefaults value.
+private enum DocumentsSidebarWidthPolicy {
+    static let defaultsKey = "documentsSidebarWidth"
+    static let fallback: Double = 560
+    static let preferredMin: CGFloat = 420
+    static let preferredMax: CGFloat = 900
+    static let mainPageReserve: CGFloat = 240
+    static let collapsedFloor: CGFloat = 160
+
+    static func preferredIdeal(stored: Double) -> CGFloat {
+        let width = CGFloat(stored)
+        guard width >= preferredMin, width <= preferredMax else { return CGFloat(fallback) }
+        return width
+    }
+
+    /// Nil when this window is too narrow to give the sidebar its saved width.
+    static func enforced(
+        stored: Double,
+        columnMin: CGFloat,
+        columnMax: CGFloat,
+        availableWidth: CGFloat
+    ) -> CGFloat? {
+        let preferred = preferredIdeal(stored: stored)
+        guard preferred + mainPageReserve <= availableWidth + 0.5 else { return nil }
+        return min(columnMax, max(columnMin, preferred))
+    }
+
+    /// Finished divider drag. Nil while the window is squeezing the column below its preferred minimum.
+    static func preferenceToRemember(measured: CGFloat, availableWidth: CGFloat) -> Double? {
+        let windowLimitedMin = min(preferredMin, max(collapsedFloor, availableWidth - mainPageReserve))
+        if windowLimitedMin < preferredMin - 0.5 { return nil }
+        let rounded = measured.rounded()
+        guard rounded >= preferredMin - 1, rounded <= preferredMax + 1 else { return nil }
+        return Double(min(preferredMax, max(preferredMin, rounded)))
+    }
+}
+
+/// Writes a sidebar divider drag into the shared width, and applies that width on every sidebar tab.
+private struct DocumentsSidebarWidthSync: NSViewRepresentable {
+    var enforcedWidth: CGFloat?
+    var remembersDrag: Bool
+    var sidebarTab: SidebarTab
+    var availableWidth: CGFloat
+    var onCommit: (Double) -> Void
+
+    func makeNSView(context: Context) -> DocumentsSidebarWidthSyncView {
+        let view = DocumentsSidebarWidthSyncView()
+        view.setAccessibilityElement(false)
+        return view
+    }
+
+    func updateNSView(_ nsView: DocumentsSidebarWidthSyncView, context: Context) {
+        let widthChanged = !Self.sameWidth(nsView.enforcedWidth, enforcedWidth)
+        let tabChanged = nsView.sidebarTab != sidebarTab
+        nsView.remembersDrag = remembersDrag
+        nsView.sidebarTab = sidebarTab
+        nsView.availableWidth = availableWidth
+        nsView.onCommit = onCommit
+        nsView.enforcedWidth = enforcedWidth
+        nsView.ensureObserving()
+        if widthChanged || tabChanged {
+            nsView.correctionCount = 0
+            nsView.scheduleApply()
+        }
+    }
+
+    static func dismantleNSView(_ nsView: DocumentsSidebarWidthSyncView, coordinator: Coordinator) {
+        nsView.teardown()
+    }
+
+    private static func sameWidth(_ lhs: CGFloat?, _ rhs: CGFloat?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil):
+            return true
+        case let (lhs?, rhs?):
+            return abs(lhs - rhs) <= 0.5
+        default:
+            return false
+        }
+    }
+}
+
+private final class DocumentsSidebarWidthSyncView: NSView {
+    var enforcedWidth: CGFloat?
+    var remembersDrag = false
+    var sidebarTab = SidebarTab.ingest
+    var availableWidth: CGFloat = 0
+    var onCommit: (Double) -> Void = { _ in }
+    var correctionCount = 0
+
+    private var splitView: NSSplitView?
+    private var keyObserver: NSObjectProtocol?
+    private var mouseMonitor: Any?
+    private var trackingDivider = false
+    private var applyTicket = 0
+
+    deinit {
+        teardown()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else {
+            detachObservers()
+            splitView = nil
+            trackingDivider = false
+            return
+        }
+        observeKeyWindow()
+        ensureObserving()
+        scheduleApply()
+    }
+
+    func teardown() {
+        detachObservers()
+        splitView = nil
+        trackingDivider = false
+        applyTicket += 1
+    }
+
+    func ensureObserving() {
+        let split = nearestSplitView
+        if split !== splitView {
+            splitView = split
+        }
+        guard mouseMonitor == nil, window != nil else { return }
+        mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] event in
+            MainActor.assumeIsolated {
+                self?.trackDivider(event)
+            }
+            return event
+        }
+    }
+
+    private func observeKeyWindow() {
+        if let keyObserver {
+            NotificationCenter.default.removeObserver(keyObserver)
+            self.keyObserver = nil
+        }
+        guard let window else { return }
+        keyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            // Split constraints are still the previous tab's until this notification returns.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.correctionCount = 0
+                self.scheduleApply()
+            }
+        }
+    }
+
+    func scheduleApply() {
+        applyTicket += 1
+        let ticket = applyTicket
+        DispatchQueue.main.async { [weak self] in
+            guard let self, ticket == self.applyTicket else { return }
+            self.ensureObserving()
+            guard let target = self.enforcedWidth else { return }
+            self.apply(target)
+        }
+    }
+
+    private func detachObservers() {
+        if let mouseMonitor {
+            NSEvent.removeMonitor(mouseMonitor)
+            self.mouseMonitor = nil
+        }
+        if let keyObserver {
+            NotificationCenter.default.removeObserver(keyObserver)
+            self.keyObserver = nil
+        }
+    }
+
+    private func trackDivider(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            trackingDivider = remembersDrag && eventHitsDivider(event)
+        case .leftMouseUp:
+            guard trackingDivider else { return }
+            trackingDivider = false
+            guard remembersDrag, let measured = currentSidebarWidth else { return }
+            if let enforcedWidth, abs(measured - enforcedWidth) < 1 { return }
+            guard let remembered = DocumentsSidebarWidthPolicy.preferenceToRemember(
+                measured: measured,
+                availableWidth: availableWidth
+            ) else { return }
+            let commit = onCommit
+            Task { @MainActor in
+                commit(remembered)
+            }
+        default:
+            break
+        }
+    }
+
+    private func eventHitsDivider(_ event: NSEvent) -> Bool {
+        guard let split = splitView, split.isVertical, event.window === split.window else { return false }
+        guard let sidebar = sidebarPane(in: split), !split.isSubviewCollapsed(sidebar) else { return false }
+        let point = split.convert(event.locationInWindow, from: nil)
+        return abs(point.x - sidebar.frame.maxX) <= max(30, split.dividerThickness + 8)
+    }
+
+    private func apply(_ target: CGFloat) {
+        guard let split = splitView, split.isVertical, let sidebar = sidebarPane(in: split) else { return }
+        guard split.arrangedSubviews.first === sidebar, !split.isSubviewCollapsed(sidebar) else { return }
+        let current = sidebar.frame.width
+        guard abs(current - target) > 1 else {
+            correctionCount = 0
+            return
+        }
+        let lower = split.minPossiblePositionOfDivider(at: 0)
+        let upper = split.maxPossiblePositionOfDivider(at: 0)
+        guard upper + 0.5 >= lower else { return }
+        let position = min(max(target, lower), upper)
+        guard abs(current - position) > 1 else {
+            // Constraints can still be the previous column's max for a moment. Try again next turn.
+            guard abs(current - target) > 1, correctionCount < 5 else { return }
+            correctionCount += 1
+            scheduleApply()
+            return
+        }
+        let previous = current
+        split.setPosition(position, ofDividerAt: 0)
+        if split.isSubviewCollapsed(sidebar) || sidebar.frame.width < 1 {
+            split.setPosition(previous, ofDividerAt: 0)
+            return
+        }
+        guard abs(sidebar.frame.width - target) > 1, correctionCount < 5 else {
+            if abs(sidebar.frame.width - target) <= 1 {
+                correctionCount = 0
+            }
+            return
+        }
+        correctionCount += 1
+        scheduleApply()
+    }
+
+    private var currentSidebarWidth: CGFloat? {
+        guard let split = splitView, let sidebar = sidebarPane(in: split) else { return nil }
+        let width = sidebar.frame.width
+        guard width > 1 else { return nil }
+        return width
+    }
+
+    /// The pane that contains this view, or the leading pane when SwiftUI places the anchor beside the column.
+    private func sidebarPane(in split: NSSplitView) -> NSView? {
+        var view: NSView? = self
+        while let current = view, current !== split {
+            if current.superview === split {
+                return current
+            }
+            view = current.superview
+        }
+        return split.arrangedSubviews.first
+    }
+
+    private var nearestSplitView: NSSplitView? {
+        if let ancestor = sequence(first: superview, next: { $0?.superview }).compactMap({ $0 as? NSSplitView }).first {
+            return ancestor
+        }
+        guard let content = window?.contentView else { return nil }
+        return firstVerticalSplit(in: content)
+    }
+
+    private func firstVerticalSplit(in view: NSView) -> NSSplitView? {
+        if let split = view as? NSSplitView, split.isVertical {
+            return split
+        }
+        for child in view.subviews {
+            if let found = firstVerticalSplit(in: child) {
+                return found
+            }
+        }
+        return nil
+    }
+}
+#endif
+
+#if os(macOS)
+/// Keeps the window-tab "+" button in the toolbar when a wide sidebar would leave it on the sidebar's trailing edge.
+private struct NewTabButtonKeeper: NSViewRepresentable {
+    func makeNSView(context: Context) -> NewTabButtonKeeperView {
+        let view = NewTabButtonKeeperView()
+        view.setAccessibilityElement(false)
+        return view
+    }
+
+    func updateNSView(_ nsView: NewTabButtonKeeperView, context: Context) {
+        nsView.schedule()
+    }
+
+    static func dismantleNSView(_ nsView: NewTabButtonKeeperView, coordinator: Coordinator) {
+        nsView.restoreIfNeeded()
+    }
+}
+
+/// The system button is `NSTabBarNewTabButton`, pinned to the trailing edge of the tab bar.
+/// A sidebar that reaches that edge puts the button on the sidebar. It then sits in the title bar,
+/// just before the trailing toolbar controls.
+private final class NewTabButtonKeeperView: NSView {
+    private weak var parkedBar: NSView?
+    private var parkedConstraints: [NSLayoutConstraint] = []
+    private var liftConstraints: [NSLayoutConstraint] = []
+    private var softened: [(NSLayoutConstraint, NSLayoutConstraint.Priority)] = []
+    private var resizeObserver: NSObjectProtocol?
+    private var splitObserver: NSObjectProtocol?
+    private var watchTimer: Timer?
+    private var applyTicket = 0
+
+    private static let trailingID = "mmlm.newTabLift"
+    private static let buttonSide: CGFloat = 28
+    private static let edgeSlop: CGFloat = 8
+    private static let clusterGap: CGFloat = 6
+    private static let minimumLeading: CGFloat = 78
+
+    deinit {
+        if let resizeObserver {
+            NotificationCenter.default.removeObserver(resizeObserver)
+        }
+        if let splitObserver {
+            NotificationCenter.default.removeObserver(splitObserver)
+        }
+        watchTimer?.invalidate()
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func layout() {
+        super.layout()
+        schedule()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let resizeObserver {
+            NotificationCenter.default.removeObserver(resizeObserver)
+            self.resizeObserver = nil
+        }
+        if let splitObserver {
+            NotificationCenter.default.removeObserver(splitObserver)
+            self.splitObserver = nil
+        }
+        watchTimer?.invalidate()
+        watchTimer = nil
+        guard let window else { return }
+        resizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                self?.schedule()
+            }
+        }
+        splitObserver = NotificationCenter.default.addObserver(
+            forName: NSSplitView.didResizeSubviewsNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self, let split = note.object as? NSSplitView, split.window === self.window else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.schedule()
+            }
+        }
+        let timer = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.schedule()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchTimer = timer
+        schedule()
+    }
+
+    func schedule() {
+        applyTicket += 1
+        let ticket = applyTicket
+        DispatchQueue.main.async { [weak self] in
+            guard let self, ticket == self.applyTicket else { return }
+            self.apply()
+        }
+    }
+
+    func restoreIfNeeded() {
+        guard let window, let button = Self.newTabButton(in: window) else { return }
+        restore(button)
+    }
+
+    private func apply() {
+        guard let window, let button = Self.newTabButton(in: window) else { return }
+        guard let sidebarMaxX = Self.sidebarMaxX(in: window),
+              let tabBar = Self.find("NSTabBar", in: window) else {
+            restore(button)
+            return
+        }
+        let restingMinX = tabBar.convert(
+            NSPoint(x: tabBar.bounds.width - 8 - Self.buttonSide, y: 0),
+            to: nil
+        ).x
+        if restingMinX < sidebarMaxX + Self.edgeSlop {
+            lift(button, in: window)
+        } else {
+            restore(button)
+        }
+    }
+
+    private func lift(_ button: NSView, in window: NSWindow) {
+        guard let titlebar = Self.find("NSTitlebarView", in: window),
+              let toolbar = Self.find("NSToolbarView", in: window) else { return }
+        if button.superview !== titlebar {
+            guard let bar = button.superview else { return }
+            NSLayoutConstraint.deactivate(liftConstraints)
+            liftConstraints = []
+            parkedBar = bar
+            parkedConstraints = bar.constraints.filter { Self.involves($0, button) }
+            NSLayoutConstraint.deactivate(parkedConstraints)
+            softenSizing(of: button)
+            button.removeFromSuperview()
+            titlebar.addSubview(button)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            let trailing = button.trailingAnchor.constraint(equalTo: titlebar.trailingAnchor)
+            trailing.identifier = Self.trailingID
+            liftConstraints = [
+                trailing,
+                button.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+                button.widthAnchor.constraint(equalToConstant: Self.buttonSide),
+                button.heightAnchor.constraint(equalToConstant: Self.buttonSide),
+            ]
+            NSLayoutConstraint.activate(liftConstraints)
+        }
+        guard let trailing = liftConstraints.first(where: { $0.identifier == Self.trailingID }) else { return }
+        let desired = trailingConstant(titlebar: titlebar, ignoring: button)
+        guard abs(trailing.constant - desired) > 0.5 else { return }
+        trailing.constant = desired
+    }
+
+    private func restore(_ button: NSView) {
+        guard let bar = parkedBar, button.superview !== bar else { return }
+        NSLayoutConstraint.deactivate(liftConstraints)
+        liftConstraints = []
+        button.removeFromSuperview()
+        bar.addSubview(button)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate(parkedConstraints)
+        parkedConstraints = []
+        parkedBar = nil
+        restoreSizing()
+    }
+
+    private func trailingConstant(titlebar: NSView, ignoring button: NSView) -> CGFloat {
+        let width = titlebar.bounds.width
+        let cluster = Self.toolbarClusterMinX(in: titlebar, ignoring: button)
+        let targetMaxX = max(Self.minimumLeading + Self.buttonSide, (cluster ?? width - 8) - Self.clusterGap)
+        return targetMaxX - width
+    }
+
+    private func softenSizing(of button: NSView) {
+        softened.removeAll()
+        for constraint in button.constraints {
+            guard constraint.secondItem == nil,
+                  constraint.firstAttribute == .width || constraint.firstAttribute == .height,
+                  constraint.priority == .required else { continue }
+            softened.append((constraint, constraint.priority))
+            constraint.priority = .defaultHigh
+        }
+    }
+
+    private func restoreSizing() {
+        for (constraint, priority) in softened {
+            constraint.priority = priority
+        }
+        softened.removeAll()
+    }
+
+    private static func involves(_ constraint: NSLayoutConstraint, _ view: NSView) -> Bool {
+        (constraint.firstItem as? NSView) === view || (constraint.secondItem as? NSView) === view
+    }
+
+    private static func newTabButton(in window: NSWindow) -> NSView? {
+        guard let root = window.contentView?.superview else { return nil }
+        return find("NSTabBarNewTabButton", in: root)
+    }
+
+    private static func find(_ name: String, in window: NSWindow) -> NSView? {
+        guard let root = window.contentView?.superview else { return nil }
+        return find(name, in: root)
+    }
+
+    private static func find(_ name: String, in view: NSView) -> NSView? {
+        if String(describing: type(of: view)) == name { return view }
+        for subview in view.subviews {
+            if let found = find(name, in: subview) { return found }
+        }
+        return nil
+    }
+
+    /// Trailing edge of the narrower split pane, which is the sidebar.
+    private static func sidebarMaxX(in window: NSWindow) -> CGFloat? {
+        guard let content = window.contentView, let split = verticalSplit(in: content) else { return nil }
+        let panes = split.arrangedSubviews.map { view in
+            (view, view.convert(view.bounds, to: nil))
+        }
+        guard panes.count >= 2, let sidebar = panes.min(by: { $0.1.width < $1.1.width }) else { return nil }
+        guard !split.isSubviewCollapsed(sidebar.0), sidebar.1.width > 40 else { return nil }
+        return sidebar.1.maxX
+    }
+
+    private static func verticalSplit(in view: NSView) -> NSSplitView? {
+        if let split = view as? NSSplitView, split.isVertical { return split }
+        for subview in view.subviews {
+            if let found = verticalSplit(in: subview) { return found }
+        }
+        return nil
+    }
+
+    /// Leading edge of the trailing toolbar controls, in title-bar coordinates.
+    private static func toolbarClusterMinX(in titlebar: NSView, ignoring button: NSView) -> CGFloat? {
+        var minX: CGFloat?
+        func walk(_ view: NSView) {
+            if view !== button {
+                let name = String(describing: type(of: view))
+                if name.contains("ToolbarItemViewer") || name == "NSToolbarClippedItemsIndicator" {
+                    let frame = titlebar.convert(view.bounds, from: view)
+                    if frame.width > 16, frame.height > 16, frame.minX > titlebar.bounds.width * 0.35 {
+                        minX = min(minX ?? frame.minX, frame.minX)
+                    }
+                }
+            }
+            for subview in view.subviews where subview !== button {
+                walk(subview)
+            }
+        }
+        if let toolbar = find("NSToolbarView", in: titlebar) {
+            walk(toolbar)
+        }
+        return minX
     }
 }
 #endif

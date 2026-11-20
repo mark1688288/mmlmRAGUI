@@ -310,6 +310,148 @@ enum PDFPageGeometry {
         }
         return page.selection(from: start, to: end)
     }
+
+    /// `selection(for:)` raises if the range is empty or falls outside the page.
+    static func selection(on page: PDFPage, for range: NSRange) -> PDFSelection? {
+        guard range.location >= 0, range.length > 0 else { return nil }
+        guard NSMaxRange(range) <= page.numberOfCharacters else { return nil }
+        return page.selection(for: range)
+    }
+
+    /// 0 is the top of the upright page image, 1 is the bottom.
+    static func centerFromTop(of selection: PDFSelection, on page: PDFPage) -> CGFloat? {
+        let display = displayedSize(of: page)
+        guard display.height > 1 else { return nil }
+        let upright = selection.bounds(for: page).applying(page.transform(for: box))
+        guard upright.isNull == false, upright.isInfinite == false else { return nil }
+        guard upright.width > 0.2 || upright.height > 0.2 else { return nil }
+        let fraction = 1 - (upright.midY / display.height)
+        guard fraction.isFinite else { return nil }
+        return min(max(fraction, 0), 1)
+    }
+}
+
+/// One keyword hit in the selectable text of a previewed page.
+struct PreviewTextMatch: Equatable, Identifiable {
+    enum Source: Equatable {
+        case pdf
+        case ocr
+    }
+
+    var filename: String
+    var pageNumber: Int
+    var range: NSRange
+    var source: Source
+    /// Glyph indexes when `source` is `.ocr`. Empty for a PDF text-layer hit.
+    var ocrGlyphs: IndexSet
+
+    var id: String {
+        let kind = source == .pdf ? "pdf" : "ocr"
+        return "\(filename)\u{1e}\(pageNumber)\u{1e}\(kind)\u{1e}\(range.location)\u{1e}\(range.length)"
+    }
+
+    var pageAnchor: String {
+        Self.pageAnchor(filename: filename, page: pageNumber)
+    }
+
+    static func pageAnchor(filename: String, page: Int) -> String {
+        "preview-page:\(filename)\u{1e}\(page)"
+    }
+}
+
+/// Finds a literal keyword in the selectable text of the pages currently shown.
+/// A PDF text layer is searched directly. A page PDFKit cannot read, such as a scan,
+/// is searched once Vision has recognized the same text the page can select.
+/// Hits follow the sidebar's file order, then the active page order inside each file.
+enum PreviewTextSearch {
+    nonisolated static let options: NSString.CompareOptions = [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]
+
+    nonisolated static func ranges(in text: NSString, query: String, limit: Int) -> [NSRange] {
+        let needle = query as NSString
+        guard needle.length > 0, limit > 0, text.length > 0 else { return [] }
+        let capped = min(limit, text.length)
+        guard capped >= needle.length else { return [] }
+        var found: [NSRange] = []
+        var search = NSRange(location: 0, length: capped)
+        while search.length >= needle.length {
+            let hit = text.range(of: query, options: options, range: search)
+            guard hit.location != NSNotFound, hit.length > 0, NSMaxRange(hit) <= capped else { break }
+            found.append(hit)
+            let next = NSMaxRange(hit)
+            guard next < capped else { break }
+            search = NSRange(location: next, length: capped - next)
+        }
+        return found
+    }
+
+    /// Nil when the page has no PDF text layer. Those pages are selected through OCR.
+    static func pdfText(of page: PDFPage) -> NSString? {
+        guard page.numberOfCharacters > 0, let raw = page.string else { return nil }
+        guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return raw as NSString
+    }
+
+    static func matches(in groups: [CitedDocument], query: String, order: CitationPageOrder) -> [PreviewTextMatch] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        var matches: [PreviewTextMatch] = []
+        for group in groups {
+            for page in orderedPages(in: group, order: order) {
+                guard let pdfPage = page.pdfPage else { continue }
+                if let text = pdfText(of: pdfPage) {
+                    let limit = min(text.length, pdfPage.numberOfCharacters)
+                    for range in ranges(in: text, query: trimmed, limit: limit) {
+                        matches.append(
+                            PreviewTextMatch(
+                                filename: group.filename,
+                                pageNumber: page.page,
+                                range: range,
+                                source: .pdf,
+                                ocrGlyphs: []
+                            )
+                        )
+                    }
+                } else {
+                    let key = PreviewOCRCache.key(filename: group.filename, page: page.page)
+                    guard let recognized = PreviewOCRCache.shared.stored(for: key) else { continue }
+                    for hit in recognized.searchHits(query: trimmed) where !hit.glyphs.isEmpty {
+                        matches.append(
+                            PreviewTextMatch(
+                                filename: group.filename,
+                                pageNumber: page.page,
+                                range: hit.range,
+                                source: .ocr,
+                                ocrGlyphs: hit.glyphs
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        return matches
+    }
+
+    static func centerFromTop(of match: PreviewTextMatch, in groups: [CitedDocument]) -> CGFloat? {
+        if match.source == .ocr {
+            let key = PreviewOCRCache.key(filename: match.filename, page: match.pageNumber)
+            return PreviewOCRCache.shared.stored(for: key)?.centerFromTop(of: match.ocrGlyphs)
+        }
+        for group in groups where group.filename == match.filename {
+            guard let pdfPage = group.pages.first(where: { $0.page == match.pageNumber })?.pdfPage else { continue }
+            guard let selection = PDFPageGeometry.selection(on: pdfPage, for: match.range) else { return nil }
+            return PDFPageGeometry.centerFromTop(of: selection, on: pdfPage)
+        }
+        return nil
+    }
+
+    private static func orderedPages(in group: CitedDocument, order: CitationPageOrder) -> [RenderedPage] {
+        switch order {
+        case .source:
+            group.pages
+        case .pageNumber:
+            group.pages.sorted { $0.page < $1.page }
+        }
+    }
 }
 
 /// Vision OCR of one rendered page. Boxes are normalized to that image, origin at the lower-left.
@@ -335,6 +477,65 @@ private nonisolated struct RecognizedPageText: Sendable {
             lineID += 1
         }
         self.glyphs = glyphs
+    }
+
+    struct SearchHit {
+        var range: NSRange
+        var glyphs: IndexSet
+    }
+
+    init(glyphs: [Glyph]) {
+        self.glyphs = glyphs
+    }
+
+    func searchHits(query: String) -> [SearchHit] {
+        let mapped = searchMap()
+        return PreviewTextSearch.ranges(in: mapped.string, query: query, limit: mapped.string.length).compactMap { range in
+            var indexes = IndexSet()
+            let end = min(NSMaxRange(range), mapped.owners.count)
+            guard range.location >= 0, range.location < end else { return nil }
+            for offset in range.location..<end {
+                let owner = mapped.owners[offset]
+                guard owner >= 0 else { continue }
+                indexes.insert(owner)
+            }
+            guard !indexes.isEmpty else { return nil }
+            return SearchHit(range: range, glyphs: indexes)
+        }
+    }
+
+    /// 0 is the top of the upright page image.
+    func centerFromTop(of indexes: IndexSet) -> CGFloat? {
+        var union: CGRect?
+        for index in indexes where glyphs.indices.contains(index) {
+            let box = glyphs[index].bounds
+            union = union.map { $0.union(box) } ?? box
+        }
+        guard let union, union.isNull == false, union.isInfinite == false else { return nil }
+        guard union.width > 0.000_5 || union.height > 0.000_5 else { return nil }
+        let fraction = 1 - union.midY
+        guard fraction.isFinite else { return nil }
+        return min(max(fraction, 0), 1)
+    }
+
+    /// UTF-16 owners are glyph indexes. A line break is `-1` so a hit cannot land on it.
+    private func searchMap() -> (string: NSString, owners: [Int]) {
+        var raw = ""
+        var owners: [Int] = []
+        var previousLine: Int?
+        for (index, glyph) in glyphs.enumerated() {
+            if let previousLine, glyph.lineID != previousLine {
+                raw.append("\n")
+                owners.append(-1)
+            }
+            previousLine = glyph.lineID
+            let piece = glyph.text as NSString
+            raw.append(glyph.text)
+            for _ in 0..<piece.length {
+                owners.append(index)
+            }
+        }
+        return (raw as NSString, owners)
     }
 
     func text(in indexes: IndexSet) -> String {
@@ -519,21 +720,83 @@ private nonisolated final class PageOCRJob: @unchecked Sendable {
     }
 }
 
+/// One OCR result per previewed page, shared by selection and keyword search.
+@MainActor
+private final class PreviewOCRCache {
+    static let shared = PreviewOCRCache()
+    static let readyNotification = Notification.Name("mmlmRAGUI.previewOCRReady")
+
+    private var texts: [String: RecognizedPageText] = [:]
+    private var running: [String: Task<RecognizedPageText, Never>] = [:]
+
+    static func key(filename: String, page: Int) -> String {
+        "\(filename)\u{1e}\(page)"
+    }
+
+    func stored(for key: String) -> RecognizedPageText? {
+        texts[key]
+    }
+
+    func isLoading(_ key: String) -> Bool {
+        running[key] != nil
+    }
+
+    func load(key: String, image: NSImage) async -> RecognizedPageText {
+        if let stored = texts[key] { return stored }
+        if let existing = running[key] {
+            return await existing.value
+        }
+        let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        let task = Task<RecognizedPageText, Never> { @MainActor in
+            let recognized: RecognizedPageText
+            if let cgImage {
+                let job = PageOCRJob(cgImage: cgImage)
+                recognized = await Task.detached(priority: .userInitiated) {
+                    job.recognize()
+                }.value ?? RecognizedPageText(observations: [])
+            } else {
+                recognized = RecognizedPageText(observations: [])
+            }
+            self.texts[key] = recognized
+            self.running[key] = nil
+            NotificationCenter.default.post(name: Self.readyNotification, object: key)
+            return recognized
+        }
+        running[key] = task
+        return await task.value
+    }
+}
+
 /// One cited page, drawn from its bitmap, with text selection on top.
 struct SelectablePDFPage: NSViewRepresentable {
     var image: NSImage
     var pdfPage: PDFPage
+    var textKey = ""
+    var findRanges: [NSRange] = []
+    var activeFindRange: NSRange?
+    var ocrFindGlyphs = IndexSet()
+    var activeOCRFindGlyphs = IndexSet()
+    var findReveal: Int = 0
 
     func makeNSView(context: Context) -> SelectablePDFPageView {
         let view = SelectablePDFPageView()
         view.pageImage = image
         view.pdfPage = pdfPage
+        view.textKey = textKey
         view.setAccessibilityElement(false)
         return view
     }
 
     func updateNSView(_ nsView: SelectablePDFPageView, context: Context) {
+        nsView.textKey = textKey
         nsView.show(image: image, pdfPage: pdfPage)
+        nsView.applyFind(
+            ranges: findRanges,
+            active: activeFindRange,
+            ocrGlyphs: ocrFindGlyphs,
+            activeOCR: activeOCRFindGlyphs,
+            reveal: findReveal
+        )
     }
 
     static func dismantleNSView(_ nsView: SelectablePDFPageView, coordinator: Coordinator) {
@@ -560,6 +823,7 @@ struct SelectablePDFPage: NSViewRepresentable {
 final class SelectablePDFPageView: NSView, NSMenuItemValidation {
     var pageImage: NSImage?
     var pdfPage: PDFPage?
+    var textKey = ""
 
     private let statusLabel = PassThroughLabel(frame: .zero)
     private var selection: PDFSelection?
@@ -569,10 +833,23 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
     private var dragMode: DragMode = .none
     private var selectionObserver: NSObjectProtocol?
     private var recognitionTask: Task<Void, Never>?
-    private var ocrJob: PageOCRJob?
     private var recognizedImage: NSImage?
     private var recognized: RecognizedPageText?
     private var ocrSelection: IndexSet?
+
+    private struct FindHit {
+        var range: NSRange
+        var selection: PDFSelection
+    }
+
+    private var findHits: [FindHit] = []
+    private var appliedFindRanges: [NSRange] = []
+    private var findHitsPage: PDFPage?
+    private var activeFindRange: NSRange?
+    private var ocrFindGlyphs = IndexSet()
+    private var activeOCRFindGlyphs = IndexSet()
+    private var consumedFindReveal = 0
+    private var pendingFindReveal = false
 
     private static let selectionNotification = Notification.Name("mmlmRAGUI.previewPageTextSelection")
 
@@ -620,7 +897,6 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
 
     deinit {
         recognitionTask?.cancel()
-        ocrJob?.cancel()
         if let selectionObserver {
             NotificationCenter.default.removeObserver(selectionObserver)
         }
@@ -655,6 +931,9 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
             width: size.width + 12,
             height: size.height + 4
         )
+        guard pendingFindReveal, bounds.width > 1, bounds.height > 1 else { return }
+        pendingFindReveal = false
+        scrollActiveFindIntoView()
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -677,6 +956,8 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
         NSColor.white.setFill()
         bounds.fill()
         pageImage?.draw(in: bounds)
+        drawOCRFindHighlights()
+        drawFindHighlights()
         drawSelectionHighlight()
     }
 
@@ -815,6 +1096,145 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
         return resigned
     }
 
+    func applyFind(
+        ranges: [NSRange],
+        active: NSRange?,
+        ocrGlyphs: IndexSet,
+        activeOCR: IndexSet,
+        reveal: Int
+    ) {
+        if appliedFindRanges != ranges || findHitsPage !== pdfPage {
+            appliedFindRanges = ranges
+            findHitsPage = pdfPage
+            findHits = ranges.compactMap { range in
+                guard let pdfPage, let selection = PDFPageGeometry.selection(on: pdfPage, for: range) else {
+                    return nil
+                }
+                return FindHit(range: range, selection: selection)
+            }
+            needsDisplay = true
+        }
+        if activeFindRange != active {
+            activeFindRange = active
+            needsDisplay = true
+        }
+        if ocrFindGlyphs != ocrGlyphs || activeOCRFindGlyphs != activeOCR {
+            ocrFindGlyphs = ocrGlyphs
+            activeOCRFindGlyphs = activeOCR
+            needsDisplay = true
+        }
+        guard reveal != consumedFindReveal else { return }
+        consumedFindReveal = reveal
+        guard active != nil || !activeOCR.isEmpty else { return }
+        scheduleFindReveal()
+    }
+
+    private func drawOCRFindHighlights() {
+        guard recognized != nil, !ocrFindGlyphs.isEmpty else { return }
+        let active = activeOCRFindGlyphs
+        let rest = ocrFindGlyphs.subtracting(active)
+        NSColor.systemYellow.withAlphaComponent(0.42).setFill()
+        for rect in ocrHighlightRects(for: rest) where rect.width > 0 && rect.height > 0 {
+            rect.fill()
+        }
+        NSColor.systemOrange.withAlphaComponent(0.62).setFill()
+        for rect in ocrHighlightRects(for: active) where rect.width > 0 && rect.height > 0 {
+            rect.fill()
+        }
+    }
+
+    private func drawFindHighlights() {
+        guard let pdfPage, !findHits.isEmpty, let context = NSGraphicsContext.current?.cgContext else { return }
+        let display = PDFPageGeometry.displayedSize(of: pdfPage)
+        guard display.width > 1, display.height > 1, bounds.width > 1, bounds.height > 1 else { return }
+        context.saveGState()
+        context.translateBy(x: bounds.minX, y: bounds.minY)
+        context.scaleBy(x: bounds.width / display.width, y: bounds.height / display.height)
+        context.concatenate(pdfPage.transform(for: PDFPageGeometry.box))
+        for hit in findHits where hit.range != activeFindRange {
+            fill(hit.selection, on: pdfPage, color: NSColor.systemYellow.withAlphaComponent(0.42), context: context)
+        }
+        if let activeFindRange, let active = findHits.first(where: { $0.range == activeFindRange }) {
+            fill(active.selection, on: pdfPage, color: NSColor.systemOrange.withAlphaComponent(0.62), context: context)
+        }
+        context.restoreGState()
+    }
+
+    private func fill(_ selection: PDFSelection, on page: PDFPage, color: NSColor, context: CGContext) {
+        color.setFill()
+        let lines = selection.selectionsByLine()
+        let rects = lines.isEmpty ? [selection.bounds(for: page)] : lines.map { $0.bounds(for: page) }
+        for rect in rects where rect.width > 0 && rect.height > 0 {
+            context.fill(rect)
+        }
+    }
+
+    private func scheduleFindReveal() {
+        if bounds.width > 1, bounds.height > 1 {
+            DispatchQueue.main.async { [weak self] in
+                self?.scrollActiveFindIntoView()
+            }
+        } else {
+            pendingFindReveal = true
+            needsLayout = true
+        }
+    }
+
+    private func scrollActiveFindIntoView() {
+        if !activeOCRFindGlyphs.isEmpty {
+            guard bounds.width > 1, bounds.height > 1 else {
+                pendingFindReveal = true
+                needsLayout = true
+                return
+            }
+            let rects = ocrHighlightRects(for: activeOCRFindGlyphs)
+            guard !rects.isEmpty else {
+                pendingFindReveal = true
+                return
+            }
+            var union = rects[0]
+            for rect in rects.dropFirst() {
+                union = union.union(rect)
+            }
+            scrollToVisible(union.insetBy(dx: -32, dy: -64))
+            return
+        }
+        guard let activeFindRange,
+              let hit = findHits.first(where: { $0.range == activeFindRange }) else { return }
+        guard bounds.width > 1, bounds.height > 1 else {
+            pendingFindReveal = true
+            needsLayout = true
+            return
+        }
+        let rects = viewRects(for: hit.selection)
+        guard !rects.isEmpty else { return }
+        var union = rects[0]
+        for rect in rects.dropFirst() {
+            union = union.union(rect)
+        }
+        scrollToVisible(union.insetBy(dx: -32, dy: -64))
+    }
+
+    private func pageToViewTransform() -> CGAffineTransform? {
+        guard let pdfPage else { return nil }
+        let display = PDFPageGeometry.displayedSize(of: pdfPage)
+        guard display.width > 1, display.height > 1, bounds.width > 1, bounds.height > 1 else { return nil }
+        let scale = CGAffineTransform(scaleX: bounds.width / display.width, y: bounds.height / display.height)
+        let move = CGAffineTransform(translationX: bounds.minX, y: bounds.minY)
+        return pdfPage.transform(for: PDFPageGeometry.box).concatenating(scale).concatenating(move)
+    }
+
+    private func viewRects(for selection: PDFSelection) -> [CGRect] {
+        guard let pdfPage, let transform = pageToViewTransform() else { return [] }
+        let lines = selection.selectionsByLine()
+        let pieces = lines.isEmpty ? [selection] : lines
+        return pieces.compactMap { piece in
+            let rect = piece.bounds(for: pdfPage).applying(transform)
+            guard rect.width > 0.5, rect.height > 0.5, rect.isNull == false, rect.isInfinite == false else { return nil }
+            return rect
+        }
+    }
+
     private var selectedText: String? {
         guard let text = selection?.string, !text.isEmpty else { return nil }
         return text
@@ -836,10 +1256,10 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
     }
 
     private func drawSelectionHighlight() {
-        if usesOCRSelection, ocrSelection != nil {
+        if usesOCRSelection, let ocrSelection {
             let color = selectionColor
             color.setFill()
-            for rect in ocrHighlightRects() where rect.width > 0 && rect.height > 0 {
+            for rect in ocrHighlightRects(for: ocrSelection) where rect.width > 0 && rect.height > 0 {
                 rect.fill()
             }
             return
@@ -894,9 +1314,18 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
             stopOCR()
             return
         }
-        guard recognizedImage !== image else { return }
+        let key = textKey
+        if recognizedImage === image, recognized != nil || recognitionTask != nil {
+            return
+        }
+        if !key.isEmpty, let cached = PreviewOCRCache.shared.stored(for: key) {
+            recognitionTask?.cancel()
+            recognitionTask = nil
+            recognizedImage = image
+            applyOCR(cached)
+            return
+        }
         recognitionTask?.cancel()
-        ocrJob?.cancel()
         recognized = nil
         ocrSelection = nil
         recognizedImage = image
@@ -904,18 +1333,14 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
         statusLabel.isHidden = false
         needsLayout = true
         needsDisplay = true
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        guard !key.isEmpty else {
             statusLabel.stringValue = "呢頁識別唔到文字。"
             return
         }
-        let job = PageOCRJob(cgImage: cgImage)
-        ocrJob = job
         let token = image
         recognitionTask = Task { @MainActor [weak self] in
-            let text = await Task.detached(priority: .userInitiated) {
-                job.recognize()
-            }.value
-            guard let self, !Task.isCancelled, self.recognizedImage === token else { return }
+            let text = await PreviewOCRCache.shared.load(key: key, image: image)
+            guard let self, !Task.isCancelled, self.recognizedImage === token, self.textKey == key else { return }
             self.applyOCR(text)
         }
     }
@@ -923,8 +1348,6 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
     private func stopOCR() {
         recognitionTask?.cancel()
         recognitionTask = nil
-        ocrJob?.cancel()
-        ocrJob = nil
         let showingStatus = !statusLabel.isHidden
         statusLabel.isHidden = true
         guard recognized != nil || ocrSelection != nil || recognizedImage != nil || showingStatus else { return }
@@ -935,7 +1358,6 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
     }
 
     private func applyOCR(_ text: RecognizedPageText?) {
-        ocrJob = nil
         let transcript = text?.text(in: IndexSet(integersIn: text?.glyphs.indices ?? 0..<0))
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if transcript.isEmpty {
@@ -1016,13 +1438,13 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
         )
     }
 
-    private func ocrHighlightRects() -> [CGRect] {
-        guard let recognized, let ocrSelection else { return [] }
+    private func ocrHighlightRects(for indexes: IndexSet) -> [CGRect] {
+        guard let recognized else { return [] }
         var rects: [CGRect] = []
         var current: CGRect?
         var currentLine: Int?
         var previousIndex: Int?
-        for index in ocrSelection where recognized.glyphs.indices.contains(index) {
+        for index in indexes where recognized.glyphs.indices.contains(index) {
             let glyph = recognized.glyphs[index]
             let rect = viewRect(forNormalized: glyph.bounds)
             guard rect.width > 0, rect.height > 0 else { continue }
@@ -1054,6 +1476,20 @@ struct DocumentPreview: View {
     let workingDirectory: String
     @Bindable var model: DocumentPreviewModel
 
+    @State private var findQuery = ""
+    @State private var findMatches: [PreviewTextMatch] = []
+    @State private var findIndex = 0
+    @State private var findReveal = 0
+    @State private var activeFindCenter: CGFloat?
+    @State private var findOCRPending = false
+    @State private var findOCRWaiters: Set<String> = []
+    /// Pages whose views exist. `scrollTo` a hit inside a page only after that page has been built.
+    @State private var materializedPages = MaterializedPageAnchors()
+
+    private final class MaterializedPageAnchors {
+        var anchors: Set<String> = []
+    }
+
     private var loadKey: String {
         let pages = CitationPages.orderedPages(in: answer, order: .source)
         return pages.map(\.id).joined(separator: "\u{1e}") + "\u{1f}" + workingDirectory
@@ -1061,6 +1497,9 @@ struct DocumentPreview: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if !model.groups.isEmpty {
+                findBar
+            }
             HStack {
                 Spacer(minLength: 0)
                 Picker("排序", selection: $model.pageOrder) {
@@ -1090,22 +1529,20 @@ struct DocumentPreview: View {
                         description: Text(emptyPageDescription)
                     )
                 } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 20) {
-                            if model.isLoading {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                    Text("讀緊文件頁…")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 8) {
+                                ForEach(previewRows) { row in
+                                    previewRow(row)
+                                        .id(row.id)
                                 }
                             }
-                            ForEach(model.groups) { group in
-                                documentSection(group)
-                            }
+                            .padding(.vertical, 4)
                         }
-                        .padding(.vertical, 4)
+                        .onChange(of: findReveal, initial: true) { _, _ in
+                            guard findReveal > 0 else { return }
+                            scrollFind(with: proxy)
+                        }
                     }
                 }
             }
@@ -1114,6 +1551,15 @@ struct DocumentPreview: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task(id: loadKey) {
             await model.load(answer: answer, workingDirectory: workingDirectory)
+        }
+        .onChange(of: findSourceKey, initial: true) { _, _ in
+            refreshFind(resetToFirst: false, revealCurrent: false)
+        }
+        .onChange(of: model.pageOrder) { _, _ in
+            refreshFind(resetToFirst: false, revealCurrent: true)
+        }
+        .onChange(of: findQuery) { _, _ in
+            refreshFind(resetToFirst: true, revealCurrent: true)
         }
     }
 
@@ -1139,8 +1585,17 @@ struct DocumentPreview: View {
     private func pagePreview(image: NSImage, pdfPage: PDFPage?, filename: String, pageNumber: Int) -> some View {
         Group {
             if let pdfPage {
-                SelectablePDFPage(image: image, pdfPage: pdfPage)
-                    .help("拖選文字，然後按 ⌘C 複製。掃描頁會先識別文字。")
+                SelectablePDFPage(
+                    image: image,
+                    pdfPage: pdfPage,
+                    textKey: PreviewOCRCache.key(filename: filename, page: pageNumber),
+                    findRanges: findRanges(filename: filename, pageNumber: pageNumber),
+                    activeFindRange: activeFindRange(filename: filename, pageNumber: pageNumber),
+                    ocrFindGlyphs: ocrFindGlyphs(filename: filename, pageNumber: pageNumber),
+                    activeOCRFindGlyphs: activeOCRFindGlyphs(filename: filename, pageNumber: pageNumber),
+                    findReveal: findReveal
+                )
+                .help("拖選文字，然後按 ⌘C 複製。掃描頁會先識別文字。")
             } else {
                 Image(nsImage: image)
                     .resizable()
@@ -1154,10 +1609,65 @@ struct DocumentPreview: View {
             RoundedRectangle(cornerRadius: 4)
                 .strokeBorder(.separator)
         }
+        .background {
+            findAnchor(filename: filename, pageNumber: pageNumber)
+        }
         .accessibilityLabel("\(filename) 第 \(pageNumber) 頁")
     }
 
-    private func documentSection(_ group: CitedDocument) -> some View {
+    /// One lazy row. A page id has to sit on the row itself: an id nested inside a
+    /// file section does not exist until that section has been built, so next/previous
+    /// cannot reach a later file while an earlier file is on screen.
+    private enum PreviewRow: Identifiable {
+        case loading
+        case header(CitedDocument)
+        case page(filename: String, page: RenderedPage)
+
+        var id: String {
+            switch self {
+            case .loading:
+                "preview-loading"
+            case .header(let group):
+                "preview-file:\(group.filename)"
+            case .page(let filename, let page):
+                PreviewTextMatch.pageAnchor(filename: filename, page: page.page)
+            }
+        }
+    }
+
+    private var previewRows: [PreviewRow] {
+        var rows: [PreviewRow] = []
+        if model.isLoading {
+            rows.append(.loading)
+        }
+        for group in model.groups {
+            rows.append(.header(group))
+            for page in displayedPages(in: group) {
+                rows.append(.page(filename: group.filename, page: page))
+            }
+        }
+        return rows
+    }
+
+    @ViewBuilder
+    private func previewRow(_ row: PreviewRow) -> some View {
+        switch row {
+        case .loading:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("讀緊文件頁…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case .header(let group):
+            fileHeader(group, addsTopGap: group.filename != model.groups.first?.filename)
+        case .page(let filename, let page):
+            pageRow(filename: filename, page: page)
+        }
+    }
+
+    private func fileHeader(_ group: CitedDocument, addsTopGap: Bool) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(group.filename)
                 .font(.headline)
@@ -1172,18 +1682,307 @@ struct DocumentPreview: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            ForEach(displayedPages(in: group)) { page in
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("p.\(page.page)")
-                        .font(.subheadline.weight(.semibold))
-                    if let image = page.image {
-                        pagePreview(image: image, pdfPage: page.pdfPage, filename: group.filename, pageNumber: page.page)
-                    } else if let problem = page.problem {
-                        Text(problem)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
+        }
+        .padding(.top, addsTopGap ? 12 : 0)
+    }
+
+    private func pageRow(filename: String, page: RenderedPage) -> some View {
+        let anchor = PreviewTextMatch.pageAnchor(filename: filename, page: page.page)
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("p.\(page.page)")
+                .font(.subheadline.weight(.semibold))
+            if let image = page.image {
+                pagePreview(image: image, pdfPage: page.pdfPage, filename: filename, pageNumber: page.page)
+            } else if let problem = page.problem {
+                Text(problem)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear {
+            materializedPages.anchors.insert(anchor)
+        }
+        .onDisappear {
+            materializedPages.anchors.remove(anchor)
+        }
+    }
+
+    private var trimmedFindQuery: String {
+        findQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var findSourceKey: String {
+        model.groups.map { group in
+            let pages = group.pages.map { "\($0.page):\($0.pdfPage == nil ? 0 : 1)" }.joined(separator: ",")
+            return "\(group.filename)|\(pages)"
+        }.joined(separator: "\u{1e}")
+    }
+
+    private var currentFindMatch: PreviewTextMatch? {
+        guard findMatches.indices.contains(findIndex) else { return nil }
+        return findMatches[findIndex]
+    }
+
+    private var findStatusAccessibility: String {
+        if findMatches.isEmpty {
+            return findOCRPending ? "識別緊" : "冇符合"
+        }
+        if findOCRPending {
+            return "第 \(findIndex + 1) 個，共 \(findMatches.count) 個，識別緊"
+        }
+        return "第 \(findIndex + 1) 個，共 \(findMatches.count) 個"
+    }
+
+    private var findBar: some View {
+        HStack(spacing: 6) {
+            findField
+            findStatusLabel
+            findStepButtons
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.primary.opacity(0.05))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.primary.opacity(0.16))
+        }
+        .help("搜尋預覽頁可選嘅文字。Return 或 ⌘G 下一個，⇧⌘G 上一個。掃描頁會先識別文字。")
+    }
+
+    private var findField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("搜尋文字層", text: $findQuery)
+                .textFieldStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("搜尋文字層")
+                .onSubmit { stepFind(1) }
+                .onKeyPress(.escape) {
+                    guard !findQuery.isEmpty else { return .ignored }
+                    findQuery = ""
+                    return .handled
                 }
+            if !findQuery.isEmpty {
+                Button {
+                    findQuery = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("清空搜尋")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var findStatusLabel: some View {
+        if !trimmedFindQuery.isEmpty {
+            HStack(spacing: 4) {
+                if findOCRPending {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityHidden(true)
+                }
+                Text(findMatches.isEmpty ? (findOCRPending ? "識別緊" : "冇符合") : "\(findIndex + 1) / \(findMatches.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+                    .accessibilityLabel(findStatusAccessibility)
+            }
+        }
+    }
+
+    private var findStepButtons: some View {
+        HStack(spacing: 2) {
+            findStepButton(
+                systemName: "chevron.up",
+                label: "上一個",
+                delta: -1,
+                shortcut: "g",
+                modifiers: [.command, .shift]
+            )
+            findStepButton(
+                systemName: "chevron.down",
+                label: "下一個",
+                delta: 1,
+                shortcut: "g",
+                modifiers: [.command]
+            )
+        }
+    }
+
+    private func findStepButton(
+        systemName: String,
+        label: String,
+        delta: Int,
+        shortcut: KeyEquivalent,
+        modifiers: EventModifiers
+    ) -> some View {
+        Button {
+            stepFind(delta)
+        } label: {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(findMatches.isEmpty)
+        .accessibilityLabel(label)
+        .keyboardShortcut(shortcut, modifiers: modifiers)
+        .help(label)
+    }
+
+    private func findRanges(filename: String, pageNumber: Int) -> [NSRange] {
+        findMatches.compactMap { match in
+            guard match.source == .pdf, match.filename == filename, match.pageNumber == pageNumber else { return nil }
+            return match.range
+        }
+    }
+
+    private func activeFindRange(filename: String, pageNumber: Int) -> NSRange? {
+        guard let match = currentFindMatch,
+              match.source == .pdf,
+              match.filename == filename,
+              match.pageNumber == pageNumber else { return nil }
+        return match.range
+    }
+
+    private func ocrFindGlyphs(filename: String, pageNumber: Int) -> IndexSet {
+        var glyphs = IndexSet()
+        for match in findMatches where match.source == .ocr && match.filename == filename && match.pageNumber == pageNumber {
+            glyphs.formUnion(match.ocrGlyphs)
+        }
+        return glyphs
+    }
+
+    private func activeOCRFindGlyphs(filename: String, pageNumber: Int) -> IndexSet {
+        guard let match = currentFindMatch,
+              match.source == .ocr,
+              match.filename == filename,
+              match.pageNumber == pageNumber else { return IndexSet() }
+        return match.ocrGlyphs
+    }
+
+    @ViewBuilder
+    private func findAnchor(filename: String, pageNumber: Int) -> some View {
+        if let match = currentFindMatch,
+           match.filename == filename,
+           match.pageNumber == pageNumber,
+           let fraction = activeFindCenter {
+            GeometryReader { geo in
+                let offset = min(max(fraction, 0), 1) * geo.size.height
+                VStack(spacing: 0) {
+                    Color.clear
+                        .frame(height: max(0, offset - 4))
+                    Color.clear
+                        .frame(height: 8)
+                        .id(match.id)
+                    Spacer(minLength: 0)
+                }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+    }
+
+    private func refreshFind(resetToFirst: Bool, revealCurrent: Bool) {
+        findOCRPending = trimmedFindQuery.isEmpty ? false : noteMissingOCR()
+        let previousID = currentFindMatch?.id
+        let next = PreviewTextSearch.matches(in: model.groups, query: findQuery, order: model.pageOrder)
+        findMatches = next
+        guard !next.isEmpty else {
+            findIndex = 0
+            activeFindCenter = nil
+            return
+        }
+        let newIndex: Int
+        if !resetToFirst, let previousID, let index = next.firstIndex(where: { $0.id == previousID }) {
+            newIndex = index
+        } else {
+            newIndex = 0
+        }
+        let changed = previousID != next[newIndex].id
+        findIndex = newIndex
+        syncActiveFindCenter()
+        if revealCurrent || changed {
+            findReveal += 1
+        }
+    }
+
+    /// Starts recognition for cited pages PDFKit cannot read, and reports whether any are still outstanding.
+    private func noteMissingOCR() -> Bool {
+        var missing = false
+        for group in model.groups {
+            for page in group.pages {
+                guard let pdfPage = page.pdfPage, let image = page.image else { continue }
+                guard PreviewTextSearch.pdfText(of: pdfPage) == nil else { continue }
+                let key = PreviewOCRCache.key(filename: group.filename, page: page.page)
+                if PreviewOCRCache.shared.stored(for: key) != nil { continue }
+                missing = true
+                guard !findOCRWaiters.contains(key) else { continue }
+                findOCRWaiters.insert(key)
+                Task { @MainActor in
+                    _ = await PreviewOCRCache.shared.load(key: key, image: image)
+                    findOCRWaiters.remove(key)
+                    refreshFind(resetToFirst: false, revealCurrent: false)
+                }
+            }
+        }
+        return missing
+    }
+
+    private func stepFind(_ delta: Int) {
+        guard !findMatches.isEmpty else { return }
+        let count = findMatches.count
+        findIndex = (findIndex + delta + count) % count
+        syncActiveFindCenter()
+        findReveal += 1
+    }
+
+    private func syncActiveFindCenter() {
+        guard let match = currentFindMatch else {
+            activeFindCenter = nil
+            return
+        }
+        activeFindCenter = PreviewTextSearch.centerFromTop(of: match, in: model.groups)
+    }
+
+    private func scrollFind(with proxy: ScrollViewProxy) {
+        guard let match = currentFindMatch else { return }
+        let ticket = findReveal
+        let pageID = match.pageAnchor
+        let matchID = match.id
+        let pages = materializedPages
+        if pages.anchors.contains(pageID) {
+            proxy.scrollTo(matchID, anchor: .center)
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 80_000_000)
+                guard ticket == findReveal else { return }
+                proxy.scrollTo(matchID, anchor: .center)
+            }
+            return
+        }
+        proxy.scrollTo(pageID, anchor: .center)
+        Task { @MainActor in
+            for _ in 0..<10 {
+                try? await Task.sleep(nanoseconds: 40_000_000)
+                guard ticket == findReveal else { return }
+                if pages.anchors.contains(pageID) {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    guard ticket == findReveal else { return }
+                    proxy.scrollTo(matchID, anchor: .center)
+                    try? await Task.sleep(nanoseconds: 90_000_000)
+                    guard ticket == findReveal else { return }
+                    proxy.scrollTo(matchID, anchor: .center)
+                    return
+                }
+                proxy.scrollTo(pageID, anchor: .center)
             }
         }
     }
