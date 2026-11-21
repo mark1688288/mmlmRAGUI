@@ -25,7 +25,7 @@ enum RagCommandError: LocalizedError {
         case .launch(let message):
             return message
         case .exit(let code):
-            return "rag 結束，代碼 \(code)。"
+            return UICopy.fill("rag exited with code {code}.", ["code": String(code)])
         }
     }
 }
@@ -102,7 +102,7 @@ final class RagSettings {
         didSet { defaults.set(workingDirectory, forKey: Keys.directory) }
     }
 
-    var statusText = "未檢查。"
+    var statusText = "Not checked yet."
 
     private let defaults = UserDefaults.standard
 
@@ -183,13 +183,13 @@ final class RagSession {
         let expanded = (ragPath as NSString).expandingTildeInPath
         if Self.isDirectory(expanded) {
             guard Self.projectRoot(at: expanded) != nil else {
-                errorMessage = "呢個路徑係資料夾，唔係可執行的 rag。語料目錄要包含 rag.toml，請填喺工作目錄。"
+                errorMessage = ui("This path is a folder, not an executable rag. A corpus folder must contain rag.toml. Put that folder in the working directory.")
                 return
             }
         } else if Self.isRunnableFile(expanded) {
             ragPath = expanded
         } else {
-            errorMessage = "呢個路徑唔係可執行的 rag。"
+            errorMessage = ui("This path is not an executable rag.")
             return
         }
         guard await locateIfNeeded() else {
@@ -198,16 +198,16 @@ final class RagSession {
         }
         if Self.isDirectory(expanded) {
             if Self.sourceRoot(near: workingDirectory) != nil {
-                notice = "工作目錄已設為 \(workingDirectory)，並用裡面的程式。"
+                notice = ui("Working directory set to {path}, using the program inside it.", ["path": workingDirectory])
             } else {
-                notice = "工作目錄已設為 \(workingDirectory)。"
+                notice = ui("Working directory set to {path}.", ["path": workingDirectory])
             }
         }
         await refreshStatus()
     }
 
     func refreshStatus() async {
-        guard let generation = beginJob(label: "檢查狀態") else { return }
+        guard let generation = beginJob(label: ui("Checking status")) else { return }
         let task = Task { await performStatus(generation: generation) }
         job = task
         await task.value
@@ -230,13 +230,13 @@ final class RagSession {
         let files = urls.filter { Self.isAcceptedFile($0) }
         let skipped = urls.count - files.count
         guard !files.isEmpty else {
-            errorMessage = "唔支援呢個項目。入庫接受 pdf、docx、pptx、文字同圖像，每次一個檔案。"
+            errorMessage = ui("This item isn't supported. Ingest accepts pdf, docx, pptx, text, and images, one file at a time.")
             return
         }
         ingestQueue.append(contentsOf: files)
         queuedCount = ingestQueue.count
         if skipped > 0 {
-            notice = "跳過 \(skipped) 個唔支援的項目。"
+            notice = ui("Skipped {count} unsupported items.", ["count": String(skipped)])
         }
         kickQueue()
     }
@@ -244,8 +244,8 @@ final class RagSession {
     func ask() {
         let trimmed = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let generation = beginJob(label: "等緊 rag 回覆…") else {
-            notice = "等而家呢個工作完先再提問。"
+        guard let generation = beginJob(label: ui("Waiting for rag…")) else {
+            notice = ui("Wait for the current job to finish before asking.")
             return
         }
         isAsking = true
@@ -265,7 +265,7 @@ final class RagSession {
         isBusy = false
         isAsking = false
         busyLabel = ""
-        notice = "已取消。"
+        notice = ui("Cancelled.")
     }
 
     private func performAsk(_ trimmed: String, generation: Int) async {
@@ -293,7 +293,7 @@ final class RagSession {
         }
         let url = ingestQueue.removeFirst()
         queuedCount = ingestQueue.count
-        guard let generation = beginJob(label: "入庫 \(url.lastPathComponent)") else {
+        guard let generation = beginJob(label: ui("Ingest {name}", ["name": url.lastPathComponent])) else {
             ingestQueue.insert(url, at: 0)
             queuedCount = ingestQueue.count
             return
@@ -350,7 +350,7 @@ final class RagSession {
             return
         }
         guard let directory = workingDirectoryURL else {
-            errorMessage = "工作目錄唔存在：\(workingDirectory)"
+            errorMessage = ui("Working directory does not exist: {path}", ["path": workingDirectory])
             return
         }
 
@@ -415,9 +415,9 @@ final class RagSession {
 
     private var missingToolMessage: String {
         if Self.sourceRoot(near: workingDirectory) != nil || Self.sourceRoot(near: ragPath) != nil {
-            return "搵唔到 Python，未能執行資料夾入面的 rag。"
+            return ui("Python wasn't found, so the rag in that folder can't run.")
         }
-        return "搵唔到 rag。可以用 Homebrew 裝：brew install mark1688288/mmlmrag/mmlmrag，或者自己填上可執行檔路徑。"
+        return ui("rag wasn't found. Install it with Homebrew: brew install mark1688288/mmlmrag/mmlmrag, or set the executable path yourself.")
     }
 
     private static func sourceRoot(near path: String) -> String? {

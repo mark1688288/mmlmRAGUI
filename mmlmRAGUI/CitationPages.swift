@@ -25,9 +25,9 @@ enum CitationPageOrder: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .source:
-            "答覆來源次序"
+            "Answer order"
         case .pageNumber:
-            "頁碼由小至大"
+            "Page number"
         }
     }
 }

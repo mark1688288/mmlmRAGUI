@@ -105,12 +105,21 @@ final class OpenTabCatalog {
         tabs = next
     }
 
+    /// Tabs the compare picker can offer. A blank answer is not a source.
+    var comparableTabs: [Tab] {
+        tabs.filter { Self.hasAnswer($0.answer) }
+    }
+
+    static func hasAnswer(_ answer: String) -> Bool {
+        !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     func label(for id: UUID) -> String {
-        Self.label(for: id, tabs: tabs)
+        Self.label(for: id, tabs: comparableTabs)
     }
 
     func resolvedPair(left: UUID?, right: UUID?) -> SidePair? {
-        Self.resolvedPair(ids: tabs.map(\.id), lastFrontID: lastFrontID, left: left, right: right)
+        Self.resolvedPair(ids: comparableTabs.map(\.id), lastFrontID: lastFrontID, left: left, right: right)
     }
 
     static func label(for id: UUID, tabs: [Tab]) -> String {
@@ -206,19 +215,25 @@ final class OpenTabCatalog {
 }
 
 struct TabComparePage: View {
+    /// Title bar fits the traffic lights, "Compare Tabs", the pin, and the side switch.
+    /// Stays under the one-page cutoff, so that layout can still show both buttons.
+    static let minimumWindowWidth: CGFloat = 380
+
     @State private var leftID: UUID?
     @State private var rightID: UUID?
     @State private var catalog = OpenTabCatalog.shared
     /// Narrow windows show one side. True is the left page.
     @State private var showsLeftPage = true
+    /// Floating level. The compare window stays above ordinary windows.
+    @State private var staysOnTop = false
 
     var body: some View {
         Group {
-            if catalog.tabs.count < 2 {
+            if catalog.comparableTabs.count < 2 {
                 ContentUnavailableView(
-                    "未夠兩個分頁",
+                    ui("Need two answered tabs"),
                     systemImage: "rectangle.split.2x1",
-                    description: Text("開住至少兩個 mmlmRAG 分頁，就可以左右並排比較提問同回答。")
+                    description: Text(ui("Open at least two mmlmRAG tabs that already have answers."))
                 )
             } else {
                 GeometryReader { proxy in
@@ -234,42 +249,59 @@ struct TabComparePage: View {
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(
+            minWidth: Self.minimumWindowWidth,
+            maxWidth: .infinity,
+            maxHeight: .infinity
+        )
         .background {
-            CompareWindowChrome()
+            CompareWindowChrome(staysOnTop: staysOnTop)
         }
-        .navigationTitle("比較分頁")
+        .navigationTitle(ui("Compare Tabs"))
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    staysOnTop.toggle()
+                } label: {
+                    Image(systemName: staysOnTop ? "pin.fill" : "pin")
+                }
+                .help(ui("Keep this window in front of other windows"))
+                .accessibilityLabel(ui("Pin"))
+            }
+        }
         .onAppear {
             catalog.refreshOrder()
             commitPair()
         }
-        .onChange(of: catalog.tabs.map(\.id)) { _, _ in
+        .onChange(of: catalog.comparableTabs.map(\.id)) { _, _ in
             commitPair()
         }
     }
 
     private var comparison: some View {
         HStack(spacing: 0) {
-            column(sideTitle: "左邊", selection: leftSelection)
+            column(sideTitle: ui("Left"), selection: leftSelection)
             Divider()
-            column(sideTitle: "右邊", selection: rightSelection)
+            column(sideTitle: ui("Right"), selection: rightSelection)
         }
     }
 
     /// One side at a time. The toolbar button swaps left and right.
     private var compactComparison: some View {
         column(
-            sideTitle: showsLeftPage ? "左邊" : "右邊",
+            sideTitle: showsLeftPage ? ui("Left") : ui("Right"),
             selection: showsLeftPage ? leftSelection : rightSelection
         )
         .id(showsLeftPage)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button(showsLeftPage ? "右邊" : "左邊") {
+                Button {
                     showsLeftPage.toggle()
+                } label: {
+                    Image(systemName: showsLeftPage ? "arrow.right" : "arrow.left")
                 }
-                .help(showsLeftPage ? "轉去右邊" : "轉去左邊")
-                .accessibilityLabel(showsLeftPage ? "轉去右邊" : "轉去左邊")
+                .help(showsLeftPage ? ui("Show right") : ui("Show left"))
+                .accessibilityLabel(showsLeftPage ? ui("Show right") : ui("Show left"))
             }
         }
     }
@@ -282,29 +314,29 @@ struct TabComparePage: View {
                     .font(.headline)
                 Spacer(minLength: 8)
                 Picker(sideTitle, selection: selection) {
-                    ForEach(catalog.tabs) { item in
+                    ForEach(catalog.comparableTabs) { item in
                         Text(catalog.label(for: item.id)).tag(item.id)
                     }
                 }
                 .labelsHidden()
                 .frame(maxWidth: 280)
-                .help("次序同視窗上面嘅分頁一樣，由左至右。")
+                .help(ui("Same order as the window tabs, left to right."))
             }
 
             textBlock(
-                title: "提問",
+                title: ui("Question"),
                 text: tab?.question ?? "",
-                placeholder: "未有提問。",
+                placeholder: ui("No question yet."),
                 isLoading: false,
-                itemName: "提問",
+                itemName: "Question",
                 fills: false
             )
             textBlock(
-                title: "回答",
+                title: ui("Answer"),
                 text: tab?.answer ?? "",
-                placeholder: "未有回答。",
+                placeholder: ui("No answer yet."),
                 isLoading: tab?.isAsking ?? false,
-                itemName: "回答",
+                itemName: "Answer",
                 fills: true
             )
         }
@@ -330,7 +362,7 @@ struct TabComparePage: View {
                 if isLoading && hasText {
                     ProgressView()
                         .controlSize(.small)
-                    Text("回覆緊…")
+                    Text(ui("Answering…"))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -340,7 +372,7 @@ struct TabComparePage: View {
                     VStack(spacing: 10) {
                         ProgressView()
                             .controlSize(.regular)
-                        Text("等緊 rag 回覆…")
+                        Text(ui("Waiting for rag…"))
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, minHeight: 100)
@@ -394,11 +426,11 @@ struct TabComparePage: View {
         other: UUID?,
         side: KeyPath<OpenTabCatalog.SidePair, UUID>
     ) -> UUID {
-        if let current, current != other, catalog.tabs.contains(where: { $0.id == current }) {
+        if let current, current != other, catalog.comparableTabs.contains(where: { $0.id == current }) {
             return current
         }
         let pair = catalog.resolvedPair(left: side == \.left ? current : other, right: side == \.right ? current : other)
-        return pair?[keyPath: side] ?? catalog.tabs.first?.id ?? UUID()
+        return pair?[keyPath: side] ?? catalog.comparableTabs.first?.id ?? UUID()
     }
 
     private func choose(_ newValue: UUID, as side: KeyPath<OpenTabCatalog.SidePair, UUID>) {
@@ -598,11 +630,14 @@ final class OpenTabRegistrarView: NSView {
 
 /// Keeps the compare window out of the mmlmRAG tab bar.
 private struct CompareWindowChrome: NSViewRepresentable {
+    var staysOnTop: Bool
+
     func makeNSView(context: Context) -> CompareWindowChromeView {
         CompareWindowChromeView()
     }
 
     func updateNSView(_ nsView: CompareWindowChromeView, context: Context) {
+        nsView.staysOnTop = staysOnTop
         nsView.keepSeparate()
     }
 }
@@ -610,6 +645,7 @@ private struct CompareWindowChrome: NSViewRepresentable {
 private final class CompareWindowChromeView: NSView {
     /// True while a detach is already waiting on the next turn.
     private var isDetaching = false
+    var staysOnTop = false
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         nil
@@ -622,6 +658,12 @@ private final class CompareWindowChromeView: NSView {
 
     func keepSeparate() {
         guard let window else { return }
+        window.level = staysOnTop ? .floating : .normal
+        window.hidesOnDeactivate = false
+        let minSize = window.contentMinSize
+        if minSize.width != TabComparePage.minimumWindowWidth {
+            window.contentMinSize = NSSize(width: TabComparePage.minimumWindowWidth, height: minSize.height)
+        }
         let sharesGroup = window.tabGroup?.windows.contains { $0 !== window } ?? false
         if sharesGroup {
             // Disallowing tabbing while this window is still in the content group

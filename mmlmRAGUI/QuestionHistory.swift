@@ -49,7 +49,7 @@ final class QuestionHistoryStore {
         let question = question.trimmingCharacters(in: .whitespacesAndNewlines)
         let answer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty else {
-            lastError = "未有提問，儲存唔到。"
+            lastError = ui("There's no question to save.")
             return nil
         }
         guard let database else { return nil }
@@ -100,7 +100,7 @@ final class QuestionHistoryStore {
         guard let database else { return false }
 
         if let message = execute("BEGIN IMMEDIATE", in: database) {
-            lastError = "刪除唔到提問記錄：\(message)"
+            lastError = ui("Couldn't delete the question: {detail}", ["detail": message])
             return false
         }
 
@@ -127,7 +127,7 @@ final class QuestionHistoryStore {
 
         if let message = execute("COMMIT", in: database) {
             _ = execute("ROLLBACK", in: database)
-            lastError = "刪除唔到提問記錄：\(message)"
+            lastError = ui("Couldn't delete the question: {detail}", ["detail": message])
             return false
         }
 
@@ -145,7 +145,7 @@ final class QuestionHistoryStore {
         """
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
-            lastError = "讀唔到提問記錄：\(Self.errorText(database))"
+            lastError = ui("Couldn't read questions: {detail}", ["detail": Self.errorText(database)])
             return
         }
         defer { sqlite3_finalize(statement) }
@@ -171,7 +171,7 @@ final class QuestionHistoryStore {
                 lastError = nil
                 return
             }
-            lastError = "讀唔到提問記錄：\(Self.errorText(database))"
+            lastError = ui("Couldn't read questions: {detail}", ["detail": Self.errorText(database)])
             return
         }
     }
@@ -182,7 +182,7 @@ final class QuestionHistoryStore {
             folder = try Self.storageFolder()
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } catch {
-            lastError = "開唔到提問記錄：\(error.localizedDescription)"
+            lastError = ui("Couldn't open questions: {detail}", ["detail": error.localizedDescription])
             return nil
         }
 
@@ -192,7 +192,7 @@ final class QuestionHistoryStore {
         guard sqlite3_open_v2(path, &handle, flags, nil) == SQLITE_OK, let handle else {
             let message = handle.map { Self.errorText($0) } ?? "unknown"
             sqlite3_close(handle)
-            lastError = "開唔到提問記錄：\(message)"
+            lastError = ui("Couldn't open questions: {detail}", ["detail": message])
             return nil
         }
         sqlite3_busy_timeout(handle, 2000)
@@ -218,7 +218,7 @@ final class QuestionHistoryStore {
         }
         let message = error.map { String(cString: $0) } ?? Self.errorText(database)
         sqlite3_free(error)
-        return "開唔到提問記錄：\(message)"
+        return ui("Couldn't open questions: {detail}", ["detail": message])
     }
 
     private static func storageFolder() throws -> URL {
@@ -246,11 +246,11 @@ final class QuestionHistoryStore {
     }
 
     private func writeFailure(_ database: OpaquePointer) -> String {
-        "寫唔到提問記錄：\(Self.errorText(database))"
+        ui("Couldn't write the question: {detail}", ["detail": Self.errorText(database)])
     }
 
     private func deleteFailure(_ database: OpaquePointer) -> String {
-        "刪除唔到提問記錄：\(Self.errorText(database))"
+        ui("Couldn't delete the question: {detail}", ["detail": Self.errorText(database)])
     }
 
     /// Runs one statement. Returns the SQLite message when it fails.
@@ -346,9 +346,9 @@ struct QuestionHistoryList: View {
             }
             if records.isEmpty {
                 ContentUnavailableView(
-                    "未有提問記錄",
+                    ui("No saved questions"),
                     systemImage: "clock.arrow.circlepath",
-                    description: Text("儲存之後，提問同回答會列喺呢度。")
+                    description: Text(ui("Saved questions and answers will be listed here."))
                 )
             } else {
                 searchField
@@ -391,19 +391,19 @@ struct QuestionHistoryList: View {
     }
 
     private var emptyTitle: String {
-        if assistantPhase == .checking { return "AI 幫手核對緊" }
-        if isSearching { return "搜尋緊" }
-        return "搵唔到相符記錄"
+        if assistantPhase == .checking { return ui("Assistant is checking") }
+        if isSearching { return ui("Searching") }
+        return ui("No matching questions")
     }
 
     private var emptyDetail: String {
         if assistantPhase == .checking {
-            return "對緊呢句說話係咪真係符合，包括否定。"
+            return ui("Checking whether this sentence really matches, including negation.")
         }
         if isSearching {
-            return "對緊呢句說話同已儲存的提問、回答。"
+            return ui("Comparing this sentence with saved questions and answers.")
         }
-        return "試下另一句說話，或者清空搜尋。"
+        return ui("Try another sentence, or clear the search.")
     }
 
     private var assistantCaption: String {
@@ -411,13 +411,13 @@ struct QuestionHistoryList: View {
         case .idle:
             return ""
         case .checking:
-            return "AI 幫手核對緊"
+            return ui("Assistant is checking")
         case .applied:
-            return "AI 幫手已排除否定嘅字眼"
+            return ui("Assistant excluded the negated wording")
         case .unavailable:
-            return "AI 幫手未就緒，已用否定規則排除"
+            return ui("Assistant isn't ready. Negation rules were used instead.")
         case .failed:
-            return "AI 幫手暫時回應唔到，已用否定規則排除"
+            return ui("Assistant didn't respond. Negation rules were used instead.")
         }
     }
 
@@ -426,14 +426,14 @@ struct QuestionHistoryList: View {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
-                TextField("用自然語言搜尋提問同回答", text: $query)
+                TextField(ui("Search questions and answers in plain language"), text: $query)
                     .textFieldStyle(.plain)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityLabel("搜尋歷史")
+                    .accessibilityLabel(ui("Search history"))
                 if isSearching {
                     ProgressView()
                         .controlSize(.small)
-                        .accessibilityLabel(assistantPhase == .checking ? "AI 幫手核對緊" : "搜尋緊")
+                        .accessibilityLabel(assistantPhase == .checking ? ui("Assistant is checking") : ui("Searching"))
                 }
                 if !query.isEmpty {
                     Button {
@@ -443,7 +443,7 @@ struct QuestionHistoryList: View {
                             .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("清空搜尋")
+                    .accessibilityLabel(ui("Clear search"))
                 }
             }
             .padding(.horizontal, 8)
@@ -463,7 +463,7 @@ struct QuestionHistoryList: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .help("用一句說話搜尋。AI 幫手會理解否定，例如「冇提過黃碧嬌」。")
+        .help(ui("Search with one sentence. The assistant understands negation, for example「冇提過黃碧嬌」."))
     }
 
     /// Wording matches update with the field. A negation is applied before paraphrases arrive.
@@ -560,7 +560,7 @@ struct QuestionHistoryList: View {
 
     private var selectionBar: some View {
         HStack(spacing: 8) {
-            Button(allSelected ? "取消全選" : "全選") {
+            Button(allSelected ? ui("Deselect All") : ui("Select All")) {
                 if allSelected {
                     selectedIDs.subtract(visibleIDs)
                 } else {
@@ -569,30 +569,30 @@ struct QuestionHistoryList: View {
             }
             .controlSize(.small)
             if !selectedVisibleIDs.isEmpty {
-                Text("已揀 \(selectedVisibleIDs.count) 條")
+                Text(ui("{count} selected", ["count": String(selectedVisibleIDs.count)]))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
-            Button("刪除", role: .destructive) {
+            Button(ui("Delete"), role: .destructive) {
                 deleteSelected()
             }
             .controlSize(.small)
             .disabled(selectedVisibleIDs.isEmpty)
-            .help(selectedVisibleIDs.isEmpty ? "先揀要刪除的提問記錄" : "刪除已揀的 \(selectedVisibleIDs.count) 條提問記錄")
+            .help(selectedVisibleIDs.isEmpty ? ui("Select questions to delete first") : ui("Delete {count} selected questions", ["count": String(selectedVisibleIDs.count)]))
         }
     }
 
     private func historyButton(_ record: QuestionRecord) -> some View {
         HStack(alignment: .top, spacing: 6) {
             Toggle(isOn: selectionBinding(for: record.id)) {
-                Text("揀呢條記錄")
+                Text(ui("Select this question"))
             }
             .toggleStyle(.checkbox)
             .labelsHidden()
             .fixedSize()
             .padding(.top, 8)
-            .accessibilityLabel("揀呢條記錄")
+            .accessibilityLabel(ui("Select this question"))
 
             Button {
                 onSelect(record)
@@ -601,10 +601,10 @@ struct QuestionHistoryList: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(accessibilityLabel(for: record))
-            .accessibilityHint("載入呢條提問同回答")
+            .accessibilityHint(ui("Load this question and answer"))
         }
         .contextMenu {
-            Button("開啟於新分頁") {
+            Button(ui("Open in New Tab")) {
                 onOpenInNewTab(record)
             }
         }
@@ -639,13 +639,13 @@ struct QuestionHistoryList: View {
 
     private func confirmDelete(count: Int) -> Bool {
         let alert = NSAlert()
-        alert.messageText = "刪除提問記錄"
+        alert.messageText = ui("Delete question")
         alert.informativeText = count == 1
-            ? "刪除呢條提問記錄？刪除之後搵唔返。"
-            : "刪除 \(count) 條提問記錄？刪除之後搵唔返。"
+            ? ui("Delete this question? This can't be undone.")
+            : ui("Delete {count} questions? This can't be undone.", ["count": String(count)])
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "刪除")
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: ui("Delete"))
+        alert.addButton(withTitle: ui("Cancel"))
         if alert.buttons.indices.contains(0) {
             alert.buttons[0].hasDestructiveAction = true
         }
@@ -664,7 +664,7 @@ struct QuestionHistoryList: View {
                 .lineLimit(2)
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Text(record.answer.isEmpty ? "未有回答" : record.answer)
+            Text(record.answer.isEmpty ? ui("No answer yet") : record.answer)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
@@ -695,12 +695,12 @@ struct QuestionHistoryList: View {
 
     private func accessibilityLabel(for record: QuestionRecord) -> String {
         let stamp = record.savedAt.formatted(.dateTime.year().month().day().hour().minute().second())
-        return "\(stamp)，\(record.question)"
+        return ui("{stamp}, {question}", ["stamp": stamp, "question": record.question])
     }
 
     private func helpText(for record: QuestionRecord) -> String {
         if record.workingDirectory.isEmpty {
-            return "載入呢條提問記錄"
+            return ui("Load this question")
         }
         return record.workingDirectory
     }
@@ -932,14 +932,14 @@ final class QuestionCloseGate: NSObject {
         defer { isPrompting = false }
 
         let alert = NSAlert()
-        alert.messageText = "未儲存提問記錄"
+        alert.messageText = UICopy.resolve("Unsaved question")
         alert.informativeText = asking
-            ? "回覆未完。是否不儲存提問記錄便離開？"
-            : "是否不儲存提問記錄便離開？"
+            ? UICopy.resolve("The answer isn't finished. Leave without saving this question?")
+            : UICopy.resolve("Leave without saving this question?")
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "儲存")
-        alert.addButton(withTitle: "不儲存")
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: UICopy.resolve("Save"))
+        alert.addButton(withTitle: UICopy.resolve("Don't Save"))
+        alert.addButton(withTitle: UICopy.resolve("Cancel"))
         if alert.buttons.indices.contains(1) {
             alert.buttons[1].keyEquivalent = "d"
             alert.buttons[1].keyEquivalentModifierMask = .command

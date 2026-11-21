@@ -100,7 +100,7 @@ final class DocumentPreviewModel {
                 guard ticket == generation, !Task.isCancelled, acceptsLoads else { return }
                 guard group.problem == nil, let path = group.sourcePath else { continue }
                 guard let document = openDocument(at: path) else {
-                    group.problem = "打唔開呢個 PDF。"
+                    group.problem = ui("Couldn't open this PDF.")
                     replace(group, in: &built)
                     groups = built
                     continue
@@ -159,17 +159,17 @@ final class DocumentPreviewModel {
             return CitedDocument(
                 filename: filename,
                 sourcePath: existing,
-                problem: "呢個檔唔係 PDF，預覽唔到頁面。"
+                problem: ui("This file isn't a PDF, so its pages can't be previewed.")
             )
         }
         if let path = paths.first {
             return CitedDocument(
                 filename: filename,
                 sourcePath: path,
-                problem: "檔案唔存在：\(path)"
+                problem: ui("File does not exist: {path}", ["path": path])
             )
         }
-        return CitedDocument(filename: filename, problem: "語料冇「\(filename)」。")
+        return CitedDocument(filename: filename, problem: ui("The corpus has no \u{201C}{name}\u{201D}.", ["name": filename]))
     }
 
     private func replace(_ group: CitedDocument, in built: inout [CitedDocument]) {
@@ -190,14 +190,14 @@ final class DocumentPreviewModel {
         guard pageNumber >= 1, pageNumber <= document.pageCount,
               let page = document.page(at: pageNumber - 1)
         else {
-            return RenderedPage(page: pageNumber, problem: "冇第 \(pageNumber) 頁。")
+            return RenderedPage(page: pageNumber, problem: ui("There is no page {page}.", ["page": String(pageNumber)]))
         }
         if let image = images[cacheKey] {
             return RenderedPage(page: pageNumber, image: image, pdfPage: page)
         }
         let display = PDFPageGeometry.displayedSize(of: page)
         guard display.width > 1, display.height > 1 else {
-            return RenderedPage(page: pageNumber, problem: "第 \(pageNumber) 頁冇尺寸。")
+            return RenderedPage(page: pageNumber, problem: ui("Page {page} has no size.", ["page": String(pageNumber)]))
         }
         let targetWidth: CGFloat = 1600
         let targetHeight = targetWidth * display.height / display.width
@@ -455,7 +455,7 @@ enum PreviewTextSearch {
 }
 
 /// Vision OCR of one rendered page. Boxes are normalized to that image, origin at the lower-left.
-private nonisolated struct RecognizedPageText: Sendable {
+nonisolated struct RecognizedPageText: Sendable {
     struct Glyph: Sendable {
         var text: String
         var bounds: CGRect
@@ -692,7 +692,7 @@ private nonisolated struct RecognizedPageText: Sendable {
 }
 
 /// `VNRecognizeTextRequest` is the recognizer ocrmac wraps. Cancel can run while `recognize()` is in progress.
-private nonisolated final class PageOCRJob: @unchecked Sendable {
+nonisolated final class PageOCRJob: @unchecked Sendable {
     private let image: CGImage
     private let request: VNRecognizeTextRequest
 
@@ -777,17 +777,20 @@ struct SelectablePDFPage: NSViewRepresentable {
     var ocrFindGlyphs = IndexSet()
     var activeOCRFindGlyphs = IndexSet()
     var findReveal: Int = 0
+    var caption = ""
 
     func makeNSView(context: Context) -> SelectablePDFPageView {
         let view = SelectablePDFPageView()
         view.pageImage = image
         view.pdfPage = pdfPage
         view.textKey = textKey
+        view.caption = caption
         view.setAccessibilityElement(false)
         return view
     }
 
     func updateNSView(_ nsView: SelectablePDFPageView, context: Context) {
+        nsView.caption = caption
         nsView.textKey = textKey
         nsView.show(image: image, pdfPage: pdfPage)
         nsView.applyFind(
@@ -824,6 +827,7 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
     var pageImage: NSImage?
     var pdfPage: PDFPage?
     var textKey = ""
+    var caption = ""
 
     private let statusLabel = PassThroughLabel(frame: .zero)
     private var selection: PDFSelection?
@@ -850,6 +854,8 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
     private var activeOCRFindGlyphs = IndexSet()
     private var consumedFindReveal = 0
     private var pendingFindReveal = false
+    private var cachedPictures: [PagePicture]?
+    private var cachedPicturesPage: PDFPage?
 
     private static let selectionNotification = Notification.Name("mmlmRAGUI.previewPageTextSelection")
 
@@ -868,7 +874,7 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         focusRingType = .none
-        statusLabel.stringValue = "識別緊文字…"
+        statusLabel.stringValue = UICopy.resolve("Recognizing text…")
         statusLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.drawsBackground = true
@@ -909,6 +915,8 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
         if pageChanged {
             clearSelection()
             dragMode = .none
+            cachedPictures = nil
+            cachedPicturesPage = nil
         }
         self.pdfPage = pdfPage
         if imageChanged {
@@ -1043,13 +1051,65 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = NSMenu()
-        let copyItem = NSMenuItem(title: "複製", action: #selector(copy(_:)), keyEquivalent: "")
+        let copyItem = NSMenuItem(title: UICopy.resolve("Copy"), action: #selector(copy(_:)), keyEquivalent: "")
         copyItem.target = self
         menu.addItem(copyItem)
-        let selectAllItem = NSMenuItem(title: "全選", action: #selector(selectAll(_:)), keyEquivalent: "")
+        let selectAllItem = NSMenuItem(title: UICopy.resolve("Select All"), action: #selector(selectAll(_:)), keyEquivalent: "")
         selectAllItem.target = self
         menu.addItem(selectAllItem)
+        appendPictureItems(to: menu)
         return menu
+    }
+
+    private func appendPictureItems(to menu: NSMenu) {
+        let pictures = picturesOnPage()
+        guard !pictures.isEmpty else { return }
+        menu.addItem(.separator())
+        if pictures.count == 1 {
+            menu.addItem(pictureItem(title: UICopy.resolve("Open Image"), index: 0))
+            return
+        }
+        let parent = NSMenuItem(title: UICopy.resolve("Open Image"), action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        for index in pictures.indices {
+            let title = UICopy.fill("Image {number}", ["number": String(index + 1)])
+            submenu.addItem(pictureItem(title: title, index: index))
+        }
+        parent.submenu = submenu
+        menu.addItem(parent)
+    }
+
+    private func pictureItem(title: String, index: Int) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(openPicture(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = NSNumber(value: index)
+        return item
+    }
+
+    @objc func openPicture(_ sender: NSMenuItem) {
+        guard let number = sender.representedObject as? NSNumber else { return }
+        let index = number.intValue
+        let pictures = picturesOnPage()
+        guard pictures.indices.contains(index), let pdfPage else { return }
+        guard let image = PDFPagePictures.render(pictures[index], on: pdfPage) else { return }
+        PagePictureWindow.show(image: image, title: pictureWindowTitle(index: index, count: pictures.count))
+    }
+
+    private func picturesOnPage() -> [PagePicture] {
+        guard let pdfPage else { return [] }
+        if cachedPicturesPage === pdfPage, let cachedPictures {
+            return cachedPictures
+        }
+        let found = PDFPagePictures.detect(on: pdfPage)
+        cachedPictures = found
+        cachedPicturesPage = pdfPage
+        return found
+    }
+
+    private func pictureWindowTitle(index: Int, count: Int) -> String {
+        guard count > 1 else { return caption.isEmpty ? UICopy.resolve("Open Image") : caption }
+        let name = UICopy.fill("Image {number}", ["number": String(index + 1)])
+        return caption.isEmpty ? name : "\(caption) \u{2014} \(name)"
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
@@ -1329,12 +1389,12 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
         recognized = nil
         ocrSelection = nil
         recognizedImage = image
-        statusLabel.stringValue = "識別緊文字…"
+        statusLabel.stringValue = UICopy.resolve("Recognizing text…")
         statusLabel.isHidden = false
         needsLayout = true
         needsDisplay = true
         guard !key.isEmpty else {
-            statusLabel.stringValue = "呢頁識別唔到文字。"
+            statusLabel.stringValue = UICopy.resolve("No text recognized on this page.")
             return
         }
         let token = image
@@ -1362,7 +1422,7 @@ final class SelectablePDFPageView: NSView, NSMenuItemValidation {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if transcript.isEmpty {
             recognized = text
-            statusLabel.stringValue = "呢頁識別唔到文字。"
+            statusLabel.stringValue = UICopy.resolve("No text recognized on this page.")
             statusLabel.isHidden = false
         } else {
             recognized = text
@@ -1502,29 +1562,29 @@ struct DocumentPreview: View {
             }
             HStack {
                 Spacer(minLength: 0)
-                Picker("排序", selection: $model.pageOrder) {
+                Picker(ui("Sort"), selection: $model.pageOrder) {
                     ForEach(CitationPageOrder.allCases) { order in
-                        Text(order.title).tag(order)
+                        Text(ui(order.title)).tag(order)
                     }
                 }
                 .pickerStyle(.menu)
                 .fixedSize()
-                .help("揀文件頁嘅排序")
+                .help(ui("Choose how document pages are sorted"))
             }
 
             Group {
                 if model.isLoading, model.groups.isEmpty, model.notice == nil {
-                    ProgressView("讀緊文件頁…")
+                    ProgressView(ui("Loading document pages…"))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if let notice = model.notice, model.groups.isEmpty {
                     ContentUnavailableView(
-                        "預覽唔到",
+                        ui("Can't preview"),
                         systemImage: "doc.text.magnifyingglass",
                         description: Text(notice)
                     )
                 } else if model.groups.isEmpty {
                     ContentUnavailableView(
-                        "未有文件頁",
+                        ui("No document pages yet"),
                         systemImage: "doc.richtext",
                         description: Text(emptyPageDescription)
                     )
@@ -1566,9 +1626,9 @@ struct DocumentPreview: View {
     private var emptyPageDescription: String {
         switch model.pageOrder {
         case .source:
-            "回答提到的文件頁會按答覆來源次序由上至下排喺呢度。"
+            ui("Document pages cited in the answer are listed here from top to bottom in answer order.")
         case .pageNumber:
-            "回答提到的文件頁會按頁碼由小至大排喺呢度。"
+            ui("Document pages cited in the answer are listed here by page number.")
         }
     }
 
@@ -1593,9 +1653,10 @@ struct DocumentPreview: View {
                     activeFindRange: activeFindRange(filename: filename, pageNumber: pageNumber),
                     ocrFindGlyphs: ocrFindGlyphs(filename: filename, pageNumber: pageNumber),
                     activeOCRFindGlyphs: activeOCRFindGlyphs(filename: filename, pageNumber: pageNumber),
-                    findReveal: findReveal
+                    findReveal: findReveal,
+                    caption: ui("{filename} page {page}", ["filename": filename, "page": String(pageNumber)])
                 )
-                .help("拖選文字，然後按 ⌘C 複製。掃描頁會先識別文字。")
+                .help(ui("Drag to select text, then press ⌘C to copy. Scanned pages are recognized first."))
             } else {
                 Image(nsImage: image)
                     .resizable()
@@ -1612,7 +1673,7 @@ struct DocumentPreview: View {
         .background {
             findAnchor(filename: filename, pageNumber: pageNumber)
         }
-        .accessibilityLabel("\(filename) 第 \(pageNumber) 頁")
+        .accessibilityLabel(ui("{filename} page {page}", ["filename": filename, "page": String(pageNumber)]))
     }
 
     /// One lazy row. A page id has to sit on the row itself: an id nested inside a
@@ -1656,7 +1717,7 @@ struct DocumentPreview: View {
             HStack(spacing: 8) {
                 ProgressView()
                     .controlSize(.small)
-                Text("讀緊文件頁…")
+                Text(ui("Loading document pages…"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1725,12 +1786,16 @@ struct DocumentPreview: View {
 
     private var findStatusAccessibility: String {
         if findMatches.isEmpty {
-            return findOCRPending ? "識別緊" : "冇符合"
+            return findOCRPending ? ui("Recognizing") : ui("No matches")
         }
+        let values = [
+            "index": String(findIndex + 1),
+            "total": String(findMatches.count),
+        ]
         if findOCRPending {
-            return "第 \(findIndex + 1) 個，共 \(findMatches.count) 個，識別緊"
+            return ui("Match {index} of {total}, recognizing", values)
         }
-        return "第 \(findIndex + 1) 個，共 \(findMatches.count) 個"
+        return ui("Match {index} of {total}", values)
     }
 
     private var findBar: some View {
@@ -1749,17 +1814,17 @@ struct DocumentPreview: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(Color.primary.opacity(0.16))
         }
-        .help("搜尋預覽頁可選嘅文字。Return 或 ⌘G 下一個，⇧⌘G 上一個。掃描頁會先識別文字。")
+        .help(ui("Search selectable text on the preview pages. Return or ⌘G for the next match, ⇧⌘G for the previous. Scanned pages are recognized first."))
     }
 
     private var findField: some View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
-            TextField("搜尋文字層", text: $findQuery)
+            TextField(ui("Search the text layer"), text: $findQuery)
                 .textFieldStyle(.plain)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityLabel("搜尋文字層")
+                .accessibilityLabel(ui("Search the text layer"))
                 .onSubmit { stepFind(1) }
                 .onKeyPress(.escape) {
                     guard !findQuery.isEmpty else { return .ignored }
@@ -1774,7 +1839,7 @@ struct DocumentPreview: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("清空搜尋")
+                .accessibilityLabel(ui("Clear search"))
             }
         }
     }
@@ -1788,7 +1853,7 @@ struct DocumentPreview: View {
                         .controlSize(.small)
                         .accessibilityHidden(true)
                 }
-                Text(findMatches.isEmpty ? (findOCRPending ? "識別緊" : "冇符合") : "\(findIndex + 1) / \(findMatches.count)")
+                Text(findMatches.isEmpty ? (findOCRPending ? ui("Recognizing") : ui("No matches")) : "\(findIndex + 1) / \(findMatches.count)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .fixedSize()
@@ -1801,14 +1866,14 @@ struct DocumentPreview: View {
         HStack(spacing: 2) {
             findStepButton(
                 systemName: "chevron.up",
-                label: "上一個",
+                label: ui("Previous"),
                 delta: -1,
                 shortcut: "g",
                 modifiers: [.command, .shift]
             )
             findStepButton(
                 systemName: "chevron.down",
-                label: "下一個",
+                label: ui("Next"),
                 delta: 1,
                 shortcut: "g",
                 modifiers: [.command]

@@ -15,9 +15,9 @@ enum CorpusLookup {
         var message: String {
             switch self {
             case .missing:
-                return "搵唔到工作目錄入面的 corpus.sqlite。"
+                return UICopy.resolve("corpus.sqlite wasn't found in the working directory.")
             case .unreadable(let detail):
-                return "打唔開 corpus.sqlite：\(detail)"
+                return UICopy.fill("Couldn't open corpus.sqlite: {detail}", ["detail": detail])
             }
         }
     }

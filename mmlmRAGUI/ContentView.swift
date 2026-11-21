@@ -23,9 +23,17 @@ struct ContentView: View {
     @State private var linkedRecordID: Int64?
     @State private var savedQuestion = ""
     @State private var savedAnswer = ""
+    /// A row opened from 歷史. The question stays as saved, and 提問 does not run again.
+    @State private var loadedFromHistory = false
+    /// This tab's log text area. Collapsing it hides the text and leaves the answer the room. The log still records.
+    @State private var isLogExpanded = true
+    /// Below the one-column width the two trailing icons share one glass circle, which does not draw them.
+    @State private var compactTrailingMenu = false
 
     /// Portrait width of the iPhone 18 Pro, in points (1206 px at 3x).
     static let iPhone18ProScreenWidth: CGFloat = 402
+    /// Narrowest main window, in points. Stays under the one-column cutoff.
+    static let minimumWindowWidth: CGFloat = 380
     @FocusState private var isQuestionFocused: Bool
     @Environment(\.appearsActive) private var windowIsActive
     @Environment(\.openWindow) private var openWindow
@@ -43,7 +51,7 @@ struct ContentView: View {
         ContentUnavailableView(
             "mmlmRAG",
             systemImage: "macwindow",
-            description: Text("呢個雛型淨係係 macOS 呼叫本機的 rag 命令。")
+            description: Text(ui("This prototype only runs the local rag command on macOS."))
         )
         #endif
     }
@@ -60,6 +68,12 @@ struct ContentView: View {
                 }
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            .onAppear {
+                compactTrailingMenu = isCompact
+            }
+            .onChange(of: isCompact) { _, compact in
+                compactTrailingMenu = compact
+            }
             .background {
                 SidebarToggleBridge(isExpanded: sidebarIsExpanded, toggle: toggleSidebar)
             }
@@ -67,13 +81,17 @@ struct ContentView: View {
                 NewTabButtonKeeper()
             }
         }
+        .frame(minWidth: Self.minimumWindowWidth, maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            MainWindowMinimumWidth()
+        }
         .navigationTitle(windowTitle)
         .task {
             history.prepare()
             await session.prepare()
         }
         .onChange(of: isRecordDirty) { _, dirty in
-            if dirty, session.notice == "已儲存提問記錄。" {
+            if dirty, uiSame(session.notice, "Saved this question.") {
                 session.notice = nil
             }
         }
@@ -149,30 +167,61 @@ struct ContentView: View {
             }
         }
         .alert(
-            "做唔到",
+            ui("Couldn't do that"),
             isPresented: errorPresented
         ) {
-            Button("好") {
+            Button(ui("OK")) {
                 session.errorMessage = nil
             }
         } message: {
             Text(session.errorMessage ?? "")
         }
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    openWindow(id: RagWindowID.compare)
-                } label: {
-                    Label("比較", systemImage: "rectangle.split.2x1")
+            if compactTrailingMenu {
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        compareMenuButton
+                        settingsToolbarLink
+                    } label: {
+                        Image(systemName: "ellipsis")
+                    }
+                    .help(ui("Compare") + ", " + ui("Settings"))
+                    .accessibilityLabel(ui("Compare") + ", " + ui("Settings"))
                 }
-                .help("左右並排比較兩個分頁的提問同回答")
-                .keyboardShortcut("k", modifiers: [.command, .shift])
-                SettingsLink {
-                    Label("設定", systemImage: "gearshape")
+            } else {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    compareToolbarButton
+                    settingsToolbarLink
                 }
-                .help("設定")
             }
         }
+    }
+
+    private var compareToolbarButton: some View {
+        Button {
+            openWindow(id: RagWindowID.compare)
+        } label: {
+            Label(ui("Compare"), systemImage: "rectangle.split.2x1")
+        }
+        .help(ui("Compare two tabs' questions and answers side by side"))
+        .keyboardShortcut("k", modifiers: [.command, .shift])
+    }
+
+    /// The shared toolbar button is icon-only, so a menu built from it drops the symbol.
+    private var compareMenuButton: some View {
+        Button(ui("Compare"), systemImage: "rectangle.split.2x1") {
+            openWindow(id: RagWindowID.compare)
+        }
+        .labelStyle(.titleAndIcon)
+        .help(ui("Compare two tabs' questions and answers side by side"))
+        .keyboardShortcut("k", modifiers: [.command, .shift])
+    }
+
+    private var settingsToolbarLink: some View {
+        SettingsLink {
+            Label(ui("Settings"), systemImage: "gearshape")
+        }
+        .help(ui("Settings"))
     }
 
     private var errorPresented: Binding<Bool> {
@@ -192,9 +241,10 @@ struct ContentView: View {
         return String(question.prefix(8)) + "..."
     }
 
+    /// Cited pages in the answer. Zero stays "Documents".
     private var documentsTabTitle: String {
         let count = CitationPages.orderedPages(in: session.answerText).count
-        return count == 0 ? "文件" : "文件 \(count)"
+        return count == 0 ? ui("Documents") : ui("Documents ({count})", ["count": String(count)])
     }
 
     private var sidebarIsExpanded: Bool {
@@ -216,8 +266,8 @@ struct ContentView: View {
                 Button(action: toggleSidebar) {
                     Image(systemName: "sidebar.leading")
                 }
-                .help(sidebarIsExpanded ? "隱藏側欄" : "顯示側欄")
-                .accessibilityLabel(sidebarIsExpanded ? "隱藏側欄" : "顯示側欄")
+                .help(sidebarIsExpanded ? ui("Hide Sidebar") : ui("Show Sidebar"))
+                .accessibilityLabel(sidebarIsExpanded ? ui("Hide Sidebar") : ui("Show Sidebar"))
             }
         }
     }
@@ -283,14 +333,14 @@ struct ContentView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Picker("側欄", selection: $sidebarTab) {
-                Text("入庫").tag(SidebarTab.ingest)
+            Picker(ui("Sidebar"), selection: $sidebarTab) {
+                Text(ui("Ingest")).tag(SidebarTab.ingest)
                 Text(documentsTabTitle).tag(SidebarTab.documents)
-                Text("歷史").tag(SidebarTab.history)
+                Text(ui("History")).tag(SidebarTab.history)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .accessibilityLabel("側欄")
+            .accessibilityLabel(ui("Sidebar"))
 
             switch sidebarTab {
             case .ingest:
@@ -322,13 +372,19 @@ struct ContentView: View {
             header
             questionRow
             outputPane(
-                title: "回答",
+                title: ui("Answer"),
                 text: session.answerText,
-                placeholder: "回答會顯示在呢度。",
+                placeholder: ui("The answer shows up here."),
                 isLoading: session.isAsking,
                 canCopy: true
             )
-            outputPane(title: "記錄", text: session.logText, placeholder: "入庫同提問的記錄會顯示在呢度。", monospaced: true)
+            outputPane(
+                title: ui("Log"),
+                text: session.logText,
+                placeholder: ui("Ingest and question logs show up here."),
+                monospaced: true,
+                isExpanded: $isLogExpanded
+            )
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -342,15 +398,15 @@ struct ContentView: View {
                 Text(session.busyLabel)
                     .font(.headline)
                 if session.queuedCount > 0 {
-                    Text("仲有 \(session.queuedCount) 個排隊")
+                    Text(ui("{count} more queued", ["count": String(session.queuedCount)]))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("取消", role: .cancel) {
+                Button(ui("Cancel"), role: .cancel) {
                     session.cancel()
                 }
             } else {
-                Text("本機語料")
+                Text(ui("Local corpus"))
                     .font(.headline)
                 Spacer()
                 if let notice = session.notice {
@@ -366,11 +422,11 @@ struct ContentView: View {
         VStack(spacing: 8) {
             Image(systemName: "arrow.down.doc")
                 .font(.title2)
-            Text(isTargeted ? "放低就入庫" : "拖一個檔入呢度，或者揀一個檔")
-            Text("pdf、docx、pptx、文字、圖像。每次交一個檔界 rag ingest。")
+            Text(isTargeted ? ui("Drop to ingest") : ui("Drop a file here, or choose one"))
+            Text(ui("pdf, docx, pptx, text, and images. Each file is handed to rag ingest one at a time."))
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Button("揀檔案…") {
+            Button(ui("Choose Files…")) {
                 showImporter = true
             }
         }
@@ -395,15 +451,22 @@ struct ContentView: View {
     private var questionRow: some View {
         @Bindable var session = session
         return HStack(alignment: .bottom, spacing: 8) {
-            TextField("問語料一條問題", text: $session.question, axis: .vertical)
-                .lineLimit(2...5)
-                .textFieldStyle(.roundedBorder)
-                .focused($isQuestionFocused)
-            Button("提問") {
+            if loadedFromHistory {
+                historyQuestion(session.question)
+            } else {
+                TextField(ui("Ask the corpus a question"), text: $session.question, axis: .vertical)
+                    .lineLimit(2...5)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($isQuestionFocused)
+                    .help(ui("Ask the corpus a question"))
+            }
+            Button(ui("Ask")) {
+                guard canAsk else { return }
                 session.ask()
             }
             .keyboardShortcut(.return, modifiers: .command)
-            .disabled(session.isBusy || session.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(!canAsk)
+            .help(askHelp)
             Button(saveTitle) {
                 _ = saveRecord()
             }
@@ -414,12 +477,12 @@ struct ContentView: View {
         .background {
             // A vertical-axis field treats Return as a newline, so onSubmit never fires.
             QuestionReturnMonitor(
-                isFocused: isQuestionFocused,
+                isFocused: isQuestionFocused && !loadedFromHistory,
                 consumesReturn: {
-                    !session.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    canAsk
                 },
                 submit: {
-                    guard !session.isBusy else { return }
+                    guard canAsk else { return }
                     session.ask()
                 }
             )
@@ -432,47 +495,66 @@ struct ContentView: View {
         placeholder: String,
         monospaced: Bool = false,
         isLoading: Bool = false,
-        canCopy: Bool = false
+        canCopy: Bool = false,
+        isExpanded: Binding<Bool>? = nil
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let showsBody = isExpanded?.wrappedValue ?? true
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Text(title)
                     .font(.headline)
                 if isLoading && !text.isEmpty {
                     ProgressView()
                         .controlSize(.small)
-                    Text("回覆緊…")
+                    Text(ui("Answering…"))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
-            }
-            ScrollView {
-                if isLoading && text.isEmpty {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                            .controlSize(.regular)
-                        Text("等緊 rag 回覆…")
-                            .foregroundStyle(.secondary)
+                if isExpanded != nil {
+                    Spacer(minLength: 8)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            isExpanded?.wrappedValue.toggle()
+                        }
+                    } label: {
+                        Label(
+                            showsBody ? ui("Collapse Log") : ui("Expand Log"),
+                            systemImage: showsBody ? "chevron.down" : "chevron.right"
+                        )
                     }
-                    .frame(maxWidth: .infinity, minHeight: 120)
-                    .padding(8)
-                    .accessibilityElement(children: .combine)
-                } else {
-                    Text(text.isEmpty ? placeholder : text)
-                        .font(monospaced ? .system(.body, design: .monospaced) : .body)
-                        .foregroundStyle(text.isEmpty ? .secondary : .primary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding(8)
-                        .padding(.trailing, canCopy && !text.isEmpty ? 28 : 0)
+                    .controlSize(.small)
+                    .help(showsBody ? ui("Collapse Log") : ui("Expand Log"))
                 }
             }
-            .frame(minHeight: monospaced ? 90 : 140, maxHeight: .infinity)
-            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(alignment: .topTrailing) {
-                if canCopy, !text.isEmpty {
-                    CopyTextButton(text: text)
-                        .padding(6)
+            if showsBody {
+                ScrollView {
+                    if isLoading && text.isEmpty {
+                        VStack(spacing: 10) {
+                            ProgressView()
+                                .controlSize(.regular)
+                            Text(ui("Waiting for rag…"))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 120)
+                        .padding(8)
+                        .accessibilityElement(children: .combine)
+                    } else {
+                        Text(text.isEmpty ? placeholder : text)
+                            .font(monospaced ? .system(.body, design: .monospaced) : .body)
+                            .foregroundStyle(text.isEmpty ? .secondary : .primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(8)
+                            .padding(.trailing, canCopy && !text.isEmpty ? 28 : 0)
+                    }
+                }
+                .frame(minHeight: monospaced ? 90 : 140, maxHeight: .infinity)
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(alignment: .topTrailing) {
+                    if canCopy, !text.isEmpty {
+                        CopyTextButton(text: text)
+                            .padding(6)
+                    }
                 }
             }
         }
@@ -488,36 +570,79 @@ struct ContentView: View {
         return question != savedQuestion || answer != savedAnswer
     }
 
+    /// 提問 is for a question typed in this tab. A record opened from 歷史 stays as it was saved.
+    private var canAsk: Bool {
+        !loadedFromHistory
+            && !session.isBusy
+            && !session.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Saved question text. Selectable, with the same one-click copy button as the answer.
+    private func historyQuestion(_ question: String) -> some View {
+        let canCopy = !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return ScrollView {
+            Text(question)
+                .font(.body)
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+                .padding(6)
+                .padding(.trailing, canCopy ? 28 : 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 108)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(alignment: .topTrailing) {
+            if canCopy {
+                CopyTextButton(text: question, itemName: "Question")
+                    .padding(6)
+            }
+        }
+    }
+
+    private var askHelp: String {
+        if loadedFromHistory {
+            return ui("This question was opened from history and can't be asked again")
+        }
+        return ui("Ask")
+    }
+
     private var canSave: Bool {
         isRecordDirty
             && !session.isAsking
             && !session.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !session.answerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var saveTitle: String {
         if linkedRecordID != nil && !isRecordDirty {
-            return "已儲存"
+            return ui("Saved")
         }
-        return "儲存"
+        return ui("Save")
     }
 
     private var saveHelp: String {
         if canSave {
-            return "儲存呢條提問同回答"
+            return ui("Save this question and answer")
         }
         if linkedRecordID != nil && !isRecordDirty {
-            return "呢條提問記錄已儲存"
+            return ui("This question is saved")
         }
-        return "未有可儲存的提問"
+        if !session.question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && session.answerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ui("Save this question after it has an answer")
+        }
+        return ui("Nothing to save")
     }
 
     private func deleteHistoryRecords(_ ids: Set<Int64>) {
         guard history.delete(ids: ids) else {
-            session.errorMessage = history.lastError ?? "刪除唔到提問記錄。"
+            session.errorMessage = history.lastError ?? ui("Couldn't delete the question.")
             return
         }
         releaseDeletedLink(ids)
-        session.notice = ids.count == 1 ? "已刪除 1 條提問記錄。" : "已刪除 \(ids.count) 條提問記錄。"
+        session.notice = ids.count == 1
+            ? ui("Deleted 1 question.")
+            : ui("Deleted {count} questions.", ["count": String(ids.count)])
     }
 
     /// Drops the link when another window deleted the row this tab is showing.
@@ -532,25 +657,33 @@ struct ContentView: View {
         session.question = ""
         session.answerText = ""
         session.logText = ""
-        if session.notice == "已儲存提問記錄。" {
+        loadedFromHistory = false
+        if uiSame(session.notice, "Saved this question.") {
             session.notice = nil
         }
     }
 
     @discardableResult
     private func saveRecord() -> Bool {
+        guard !session.answerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            session.errorMessage = ui("Save this question after it has an answer")
+            return false
+        }
         guard let record = history.save(
             question: session.question,
             answer: session.answerText,
             workingDirectory: session.workingDirectory
         ) else {
-            session.errorMessage = history.lastError ?? "儲存唔到提問記錄。"
+            session.errorMessage = history.lastError ?? ui("Couldn't save the question.")
             return false
         }
         linkedRecordID = record.id
         savedQuestion = record.question
         savedAnswer = record.answer
-        session.notice = "已儲存提問記錄。"
+        session.logText = ""
+        session.notice = ui("Saved this question.")
+        loadedFromHistory = true
+        isQuestionFocused = false
         return true
     }
 
@@ -574,7 +707,7 @@ struct ContentView: View {
                     return
                 }
             }
-            session.notice = "開唔到新分頁。"
+            session.notice = ui("Couldn't open a new tab.")
         }
     }
 
@@ -641,7 +774,7 @@ struct ContentView: View {
 
     private func loadRecord(_ record: QuestionRecord) {
         guard !session.isBusy else {
-            session.notice = "等而家呢個工作完先再載入。"
+            session.notice = ui("Wait for the current job to finish before loading.")
             return
         }
         if linkedRecordID == record.id && !isRecordDirty {
@@ -656,12 +789,12 @@ struct ContentView: View {
     /// Same choices as closing the tab: save, discard, or stay.
     private func confirmReplaceRecord() -> Bool {
         let alert = NSAlert()
-        alert.messageText = "未儲存提問記錄"
-        alert.informativeText = "是否不儲存提問記錄便載入另一條？"
+        alert.messageText = ui("Unsaved question")
+        alert.informativeText = ui("Load another question without saving this one?")
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "儲存")
-        alert.addButton(withTitle: "不儲存")
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: ui("Save"))
+        alert.addButton(withTitle: ui("Don't Save"))
+        alert.addButton(withTitle: ui("Cancel"))
         if alert.buttons.indices.contains(1) {
             alert.buttons[1].keyEquivalent = "d"
             alert.buttons[1].keyEquivalentModifierMask = .command
@@ -687,6 +820,8 @@ struct ContentView: View {
         linkedRecordID = record.id
         savedQuestion = record.question
         savedAnswer = record.answer
+        loadedFromHistory = true
+        isLogExpanded = false
         // Leave the field unfocused. Focusing it while the new tab settles
         // keeps the text cursor on its loading icon.
         isQuestionFocused = false
@@ -708,41 +843,41 @@ struct SettingsPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("rag 路徑")
+                Text(ui("rag path"))
                     .font(.headline)
                 TextField("/opt/homebrew/bin/rag", text: $settings.ragPath)
                     .textFieldStyle(.roundedBorder)
-                Text("可執行檔。填有 rag.toml 的資料夾會改做工作目錄。")
+                Text(ui("Executable. A folder that contains rag.toml is used as the working directory instead."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Button("使用此路徑") {
+                Button(ui("Use This Path")) {
                     Task { await session.usePathAndRefresh() }
                 }
                 .disabled(session.isBusy)
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("工作目錄")
+                Text(ui("Working Directory"))
                     .font(.headline)
                 TextField("~", text: $settings.workingDirectory)
                     .textFieldStyle(.roundedBorder)
-                Text("上層有 rag.toml 就用佢。否則用 ~/.mmlmrag/rag.toml。")
+                Text(ui("A parent folder with rag.toml is used. Otherwise ~/.mmlmrag/rag.toml."))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("狀態")
+                    Text(ui("Status"))
                         .font(.headline)
                     Spacer()
-                    Button("重新檢查") {
+                    Button(ui("Check Again")) {
                         Task { await session.refreshStatus() }
                     }
                     .disabled(session.isBusy)
                 }
                 ScrollView {
-                    Text(settings.statusText.isEmpty ? " " : settings.statusText)
+                    Text(statusDisplay)
                         .font(.system(.caption, design: .monospaced))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
@@ -754,7 +889,7 @@ struct SettingsPage: View {
         }
         .padding(20)
         .frame(
-            minWidth: 400,
+            minWidth: 380,
             idealWidth: 440,
             maxWidth: 640,
             minHeight: 480,
@@ -762,12 +897,58 @@ struct SettingsPage: View {
             maxHeight: 800
         )
     }
+
+    /// The untouched status line follows the interface language. Command output stays as rag printed it.
+    private var statusDisplay: String {
+        let text = settings.statusText
+        if text.isEmpty { return " " }
+        if text == "Not checked yet." || text == UICopy.chinese["Not checked yet."] {
+            return ui("Not checked yet.")
+        }
+        return text
+    }
+}
+
+/// Settings window. System keeps the rag path. Display chooses the interface language.
+struct SettingsTabs: View {
+    @Bindable var settings: RagSettings
+
+    var body: some View {
+        TabView {
+            Tab(ui("System"), systemImage: "gear") {
+                SettingsPage(settings: settings)
+            }
+            Tab(ui("Display"), systemImage: "textformat") {
+                DisplaySettingsPage()
+            }
+        }
+        .frame(minWidth: 380, minHeight: 560)
+    }
+}
+
+/// One option: the language used for interface text.
+struct DisplaySettingsPage: View {
+    @Bindable private var interfaceLanguage = InterfaceLanguage.shared
+
+    var body: some View {
+        Form {
+            Picker(ui("Interface Language"), selection: $interfaceLanguage.language) {
+                ForEach(AppLanguage.allCases) { language in
+                    Text(verbatim: language.nativeName).tag(language)
+                }
+            }
+            .pickerStyle(.menu)
+        }
+        .formStyle(.grouped)
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
 }
 
 /// Copies a text block in one click. The icon swaps to a checkmark, same as a code snippet.
 struct CopyTextButton: View {
     let text: String
-    var itemName = "回答"
+    var itemName = "Answer"
 
     @State private var didCopy = false
     @State private var resetTask: Task<Void, Never>?
@@ -785,8 +966,8 @@ struct CopyTextButton: View {
         .controlSize(.small)
         .disabled(!canCopy)
         .foregroundStyle(didCopy ? Color.green : Color.secondary)
-        .help(didCopy ? "已複製" : "複製\(itemName)")
-        .accessibilityLabel(didCopy ? "已複製" : "複製\(itemName)")
+        .help(didCopy ? ui("Copied") : ui("Copy {item}", ["item": ui(itemName)]))
+        .accessibilityLabel(didCopy ? ui("Copied") : ui("Copy {item}", ["item": ui(itemName)]))
         .onChange(of: text) {
             resetTask?.cancel()
             didCopy = false
@@ -984,7 +1165,7 @@ private final class SidebarToggleInstaller: NSObject {
     /// The scene's own validation leaves this command disabled, so the shortcut never arrives.
     @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         guard menuItem.action == selector else { return true }
-        menuItem.title = isExpanded() ? "Hide Sidebar" : "Show Sidebar"
+        menuItem.title = isExpanded() ? UICopy.resolve("Hide Sidebar") : UICopy.resolve("Show Sidebar")
         return true
     }
 
@@ -1458,6 +1639,42 @@ private final class DocumentsSidebarWidthSyncView: NSView {
 #endif
 
 #if os(macOS)
+/// The split view does not pass its own minimum up to the window, so the floor is applied here.
+private struct MainWindowMinimumWidth: NSViewRepresentable {
+    func makeNSView(context: Context) -> MainWindowMinimumWidthView {
+        let view = MainWindowMinimumWidthView()
+        view.setAccessibilityElement(false)
+        return view
+    }
+
+    func updateNSView(_ nsView: MainWindowMinimumWidthView, context: Context) {
+        nsView.apply()
+    }
+}
+
+private final class MainWindowMinimumWidthView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        apply()
+    }
+
+    override func layout() {
+        super.layout()
+        apply()
+    }
+
+    func apply() {
+        guard let window else { return }
+        let width = ContentView.minimumWindowWidth
+        guard window.contentMinSize.width != width else { return }
+        window.contentMinSize = NSSize(width: width, height: window.contentMinSize.height)
+    }
+}
+
 /// Keeps the window-tab "+" button in the toolbar when a wide sidebar would leave it on the sidebar's trailing edge.
 private struct NewTabButtonKeeper: NSViewRepresentable {
     func makeNSView(context: Context) -> NewTabButtonKeeperView {
