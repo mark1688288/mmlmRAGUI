@@ -1,5 +1,7 @@
 # mmlmRAGUI
 
+[中文](README.zh-Hant.md)
+
 A macOS app for the local [mmlmRAG](https://github.com/mark1688288/mmlmRAG) `rag` command.
 
 Install mmlmRAG first, then install this app, then set the local rag path and the working directory.
@@ -29,6 +31,10 @@ A local mmlmRAG checkout also works. Point **rag path** at the folder that conta
 **Working Directory** is the corpus workspace. That folder, or a parent of it, must contain `rag.toml`. Otherwise `rag` uses `~/.mmlmrag/rag.toml`.
 
 Press **Check Again** and confirm that `rag` runs.
+
+## Security
+
+Report an unfixed vulnerability with [Report a vulnerability](https://github.com/mark1688288/mmlmRAGUI/security/advisories/new). The process is in [SECURITY.md](SECURITY.md). Do not use a public issue.
 
 ## License
 
