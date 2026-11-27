@@ -910,6 +910,7 @@ struct SettingsPage: View {
 }
 
 /// Settings window. System keeps the rag path. Display chooses the interface language.
+/// Privacy Policy opens the public policy on the main branch.
 struct SettingsTabs: View {
     @Bindable var settings: RagSettings
 
@@ -921,8 +922,37 @@ struct SettingsTabs: View {
             Tab(ui("Display"), systemImage: "textformat") {
                 DisplaySettingsPage()
             }
+            Tab(ui("Privacy Policy"), systemImage: "hand.raised") {
+                PrivacyPolicyPage()
+            }
         }
         .frame(minWidth: 380, minHeight: 560)
+    }
+}
+
+/// Opens the public privacy policy. The app does not fetch the page itself.
+struct PrivacyPolicyPage: View {
+    /// Public policy on the main branch. App Store Connect uses this same URL.
+    private static let policyURL = URL(string: "https://github.com/mark1688288/mmlmRAGUI/blob/main/PRIVACY.md")
+
+    var body: some View {
+        Form {
+            Section {
+                Text(ui("This app keeps questions, answers, and settings on your Mac."))
+                if let policyURL = Self.policyURL {
+                    Link(destination: policyURL) {
+                        Label(ui("Open Privacy Policy"), systemImage: "arrow.up.right")
+                    }
+                    Text(verbatim: policyURL.absoluteString)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
