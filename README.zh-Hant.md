@@ -2,6 +2,18 @@
 
 [English](README.md)
 
+<p align="center">
+  <img src="imgs/mmlmRAGUI.png" alt="RAGUI" width="256">
+</p>
+
+<p align="center">
+  <a href="https://github.com/mark1688288/mmlmRAGUI"><img src="https://img.shields.io/badge/version-0.1.0-2F6F8F" alt="version 0.1.0"></a>
+  <a href="#2-安裝-mmlmragui"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-000000?logo=apple&logoColor=white" alt="macOS on Apple Silicon"></a>
+  <a href="https://developer.apple.com/swift/"><img src="https://img.shields.io/badge/Swift-SwiftUI-F05138?logo=swift&logoColor=white" alt="SwiftUI"></a>
+  <a href="https://github.com/mark1688288/mmlmRAG"><img src="https://img.shields.io/badge/mmlmRAG-local%20CLI-2F6F8F" alt="mmlmRAG"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--only-1F6FEB" alt="AGPL-3.0-only"></a>
+</p>
+
 適用於本機 [mmlmRAG](https://github.com/mark1688288/mmlmRAG) `rag` 命令的 macOS 應用程式。
 
 請先安裝 mmlmRAG，再安裝此應用程式，然後設定本機的 rag 路徑與工作目錄。
@@ -31,6 +43,10 @@ Ollama 與模型準備見 [mmlmRAG 說明](https://github.com/mark1688288/mmlmRA
 **工作目錄**是語料庫工作區。該資料夾或其上層資料夾必須含有 `rag.toml`。否則 `rag` 會使用 `~/.mmlmrag/rag.toml`。
 
 按 **重新檢查**，確認 `rag` 可以執行。
+
+## 私隱
+
+此應用程式將問題、回答和設定留在你的 Mac 上。見 [私隱政策](PRIVACY.zh-Hant.md)。
 
 ## 安全性
 
